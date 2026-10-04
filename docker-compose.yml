@@ -1,3 +1,9 @@
+# Fairness: the comparable tiers of the two paths get the same CPU budget
+# (TIER_CPUS, default 1.0 each) so neither wins just because Docker handed its
+# containers more of the VM:
+#   entry API      notify-api        <->  producer-api
+#   WS fan-out     ws-service        <->  notifier-consumer
+# Shared on both paths: postgres, the load generator, one uvicorn worker per API.
 services:
   postgres:
     image: postgres:16
@@ -35,12 +41,14 @@ services:
   ws-service:
     build: ./services/sync/ws-service
     container_name: notification-demo-ws-service
+    cpus: "${TIER_CPUS:-1.0}"
     ports:
       - "8003:8000"
 
   notify-api:
     build: ./services/sync/notify-api
     container_name: notification-demo-notify-api
+    cpus: "${TIER_CPUS:-1.0}"
     environment:
       DB_SERVICE_URL: http://db-service:8000
       WS_SERVICE_URL: http://ws-service:8000
@@ -100,8 +108,9 @@ services:
       timeout: 5s
       retries: 20
 
-  # One-shot job: creates notification-requests with the minimum viable
-  # config for a single-broker demo, then exits. See README.md#topic-creation.
+  # One-shot job: creates notification-requests (3 partitions, so the sink
+  # connector can run 3 parallel tasks) for a single-broker demo, then
+  # exits. See README.md#topic-creation.
   kafka-init:
     image: apache/kafka:3.7.0
     container_name: notification-demo-kafka-init
@@ -117,7 +126,7 @@ services:
       - "--bootstrap-server"
       - "broker:19092"
       - "--partitions"
-      - "1"
+      - "3"
       - "--replication-factor"
       - "1"
     restart: "no"
@@ -166,10 +175,15 @@ services:
       CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
       CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "true"
       CONNECT_PLUGIN_PATH: /usr/share/confluent-hub-components
+      # Lets a connector's JSON carry consumer.override.* settings (the
+      # default policy, None, rejects them). Used by the sink connector to
+      # raise max.poll.records - see connectors/README.md.
+      CONNECT_CONNECTOR_CLIENT_CONFIG_OVERRIDE_POLICY: All
 
   producer-api:
     build: ./services/streaming/producer-api
     container_name: notification-demo-producer-api
+    cpus: "${TIER_CPUS:-1.0}"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: broker:19092
       NOTIFICATION_TOPIC: notification-requests
@@ -182,6 +196,7 @@ services:
   notifier-consumer:
     build: ./services/streaming/notifier-consumer
     container_name: notification-demo-notifier-consumer
+    cpus: "${TIER_CPUS:-1.0}"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: broker:19092
       NOTIFICATION_TOPIC: notification-requests

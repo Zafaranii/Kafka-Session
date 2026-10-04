@@ -50,7 +50,7 @@ broker runs with `KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"`, and a one-shot
 kafka-topics.sh --create --if-not-exists \
   --topic notification-requests \
   --bootstrap-server broker:19092 \
-  --partitions 1 \
+  --partitions 3 \
   --replication-factor 1
 ```
 
@@ -65,13 +65,17 @@ produce/consume/sink before the topic exists.)
   interesting design decision a topic has (partition count) behind "it just
   appeared the first time something touched it." Making it a real step means
   there's something to point at and explain.
-- `--partitions 1` — the minimum. More partitions would let multiple
-  consumer *instances* in the same group split the load, but neither
-  consumer here needs that: the JDBC sink connector's `tasks.max` defaults
-  to `1` anyway (see `connectors/README.md`), and `notifier-consumer` runs
-  as a single instance. One partition also means strict per-key ordering
-  across the whole topic, which is a nice property to have for free in a
-  demo and costs nothing at this scale.
+- `--partitions 3` — lets the JDBC sink connector run 3 parallel tasks
+  (`tasks.max: 3` in `connectors/README.md`), one per partition, so the
+  topic drains into Postgres faster. `producer-api` keys each message by
+  `request_id`, so messages spread evenly across partitions. The trade-off:
+  ordering is only guaranteed per key (i.e. per `request_id`), not across
+  the whole topic - irrelevant here, since each `request_id` is sent once.
+  `notifier-consumer` still runs as a single instance (it holds its
+  WebSocket sessions in memory), so it simply owns all 3 partitions. Note
+  `--if-not-exists`: on an existing stack the topic is not changed; run
+  `kafka-topics.sh --alter --topic notification-requests --partitions 3`
+  once, or recreate the volumes.
 - `--replication-factor 1` — the minimum, because there's exactly one
   broker in this cluster. Replication factor can't exceed broker count;
   this isn't a "least needed configs" choice so much as the only legal

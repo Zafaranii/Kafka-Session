@@ -1,13 +1,40 @@
 import asyncio
 import os
 import time
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="notify-api")
+# One HTTP client for the whole process, created at startup, so requests
+# reuse keep-alive connections to db-service and ws-service instead of opening
+# new TCP connections on every /notify call.
+#
+# A short connect timeout matters here: once ws-service's container is
+# stopped (not just its process killed), Docker's embedded DNS drops its
+# hostname, and the default resolver can take several seconds per lookup
+# to give up - which would make each retry attempt slow instead of the
+# near-instant "connection refused" a live outage demo wants.
+http_client: httpx.AsyncClient | None = None
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global http_client
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(5.0, connect=1.5),
+        limits=httpx.Limits(max_connections=200, max_keepalive_connections=100),
+    )
+    try:
+        yield
+    finally:
+        await http_client.aclose()
+        http_client = None
+
+
+app = FastAPI(title="notify-api", lifespan=lifespan)
 
 
 def now_ms() -> float:
@@ -127,23 +154,17 @@ def health():
 async def notify(payload: NotifyPayload):
     received_at = now_ms()
     body = payload.model_dump()
-    # A short connect timeout matters here: once ws-service's container is
-    # stopped (not just its process killed), Docker's embedded DNS drops its
-    # hostname, and the default resolver can take several seconds per lookup
-    # to give up - which would make each retry attempt slow instead of the
-    # near-instant "connection refused" a live outage demo wants.
-    timeout = httpx.Timeout(5.0, connect=1.5)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        try:
-            write_resp = await client.post(f"{DB_SERVICE_URL}/write", json=body)
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=502, detail=f"db-service unreachable: {exc}") from exc
-        if write_resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"db-service failed: {write_resp.text}")
-        db_write_done_at = now_ms()
+    client = http_client
+    try:
+        write_resp = await client.post(f"{DB_SERVICE_URL}/write", json=body)
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"db-service unreachable: {exc}") from exc
+    if write_resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"db-service failed: {write_resp.text}")
+    db_write_done_at = now_ms()
 
-        push_resp, push_attempts = await push_with_retry(client, body, payload.request_id)
-        ws_push_done_at = now_ms()
+    push_resp, push_attempts = await push_with_retry(client, body, payload.request_id)
+    ws_push_done_at = now_ms()
 
     return {
         "request_id": payload.request_id,

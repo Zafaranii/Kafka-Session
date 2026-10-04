@@ -4,10 +4,13 @@ sequenceDiagram
     participant DB as db-service
     participant WS as ws-service
 
+    Note over B,WS: Connections are reused, none opened per request<br/>notify-api keeps one shared HTTP client (keep-alive) to db-service and ws-service<br/>db-service opens its Postgres pool (10 connections) once at startup
+
     B->>NA: POST /notify
     activate NA
     NA->>DB: POST /write
     activate DB
+    Note right of DB: borrow a pooled connection,<br/>INSERT, give it back<br/>(waits if all 10 are busy)
     DB-->>NA: 200 OK (row inserted)
     deactivate DB
     NA->>WS: POST /push

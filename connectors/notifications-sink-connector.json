@@ -2,13 +2,15 @@
   "name": "notifications-sink-connector",
   "config": {
     "connector.class": "io.confluent.connect.jdbc.JdbcSinkConnector",
-    "connection.url": "jdbc:postgresql://postgres:5432/notifdb",
+    "connection.url": "jdbc:postgresql://postgres:5432/notifdb?reWriteBatchedInserts=true",
     "connection.user": "notifuser",
     "connection.password": "notifpass",
     "topics": "notification-requests",
     "table.name.format": "stream_notifications",
     "insert.mode": "upsert",
     "pk.mode": "record_key",
-    "pk.fields": "request_id"
+    "pk.fields": "request_id",
+    "tasks.max": "3",
+    "consumer.override.max.poll.records": "3000"
   }
 }

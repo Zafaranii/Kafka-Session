@@ -13,18 +13,26 @@
 // touching notifications sent manually through the UI.
 //
 // Usage:
-//   node scripts/load-test.mjs [--requests 1000] [--path both|sync|streaming] [--host localhost]
+//   node scripts/load-test.mjs [--requests 1000] [--path both|sync|streaming] [--host localhost] [--first sync|streaming]
+//
+// Fairness: both paths get the same warm-up, the same cooldown gap, the same
+// request count and the same client. --first swaps which path runs first.
 
 const LOAD_TEST_PREFIX = "loadtest-";
 const DELIVERY_GRACE_MS = 15000; // how long to keep listening for stragglers after the last response
+const DRAIN_POLL_MS = 100; // how often to poll the DB row count while measuring persistence
+const DRAIN_TIMEOUT_MS = 60000; // give up waiting for all rows to be persisted after this long
+const WARMUP_REQUESTS = 200; // discarded requests per path, so JIT / connection pools / TCP are warm for both
+const COOLDOWN_MS = 3000; // idle gap between paths so one path's leftover work can't skew the next
 
 function parseArgs(argv) {
-  const args = { requests: 1000, path: "both", host: "localhost" };
+  const args = { requests: 1000, path: "both", host: "localhost", first: "sync" };
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i];
     if (key === "--requests") args.requests = parseInt(argv[++i], 10);
     else if (key === "--path") args.path = argv[++i];
     else if (key === "--host") args.host = argv[++i];
+    else if (key === "--first") args.first = argv[++i]; // which path runs first when --path both (run twice, swapping, to rule out order bias)
   }
   return args;
 }
@@ -47,8 +55,61 @@ function summarize(label, values) {
   );
 }
 
-async function runLoadTest({ label, notifyUrl, wsUrl, requestCount }) {
+async function fetchRowCount(countUrl) {
+  const resp = await fetch(countUrl);
+  const body = await resp.json();
+  return body.stream_notifications;
+}
+
+// Polls the DB until `expected` more rows than `baseline` exist, measuring
+// how long the sink connector takes to persist everything the producer
+// accepted - the time the client-response metric doesn't capture.
+async function measureDrain({ countUrl, baseline, expected, startTs }) {
+  const deadline = Date.now() + DRAIN_TIMEOUT_MS;
+  let count = baseline;
+  while (Date.now() < deadline) {
+    try {
+      count = await fetchRowCount(countUrl);
+    } catch {
+      // db-service briefly unreachable - keep polling until the deadline.
+    }
+    if (count - baseline >= expected) {
+      return { persisted: count - baseline, ms: Date.now() - startTs, complete: true };
+    }
+    await new Promise((resolve) => setTimeout(resolve, DRAIN_POLL_MS));
+  }
+  return { persisted: count - baseline, ms: Date.now() - startTs, complete: false };
+}
+
+// Fires WARMUP_REQUESTS and throws the results away. For the streaming path it
+// also waits for the sink connector to finish persisting them, so warm-up rows
+// don't leak into the measured run's row-count baseline.
+async function warmUp({ notifyUrl, countUrl }) {
+  const baseline = countUrl ? await fetchRowCount(countUrl).catch(() => null) : null;
+  const startTs = Date.now();
+  const results = await Promise.allSettled(
+    Array.from({ length: WARMUP_REQUESTS }, () =>
+      fetch(notifyUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ request_id: `${LOAD_TEST_PREFIX}${crypto.randomUUID()}`, message: "warmup" }),
+      })
+    )
+  );
+  const ok = results.filter((r) => r.status === "fulfilled" && r.value.status >= 200 && r.value.status < 300).length;
+  if (countUrl && baseline !== null) {
+    await measureDrain({ countUrl, baseline, expected: ok, startTs });
+  }
+}
+
+async function runLoadTest({ label, notifyUrl, wsUrl, requestCount, countUrl }) {
   console.log(`\n=== ${label} ===`);
+  console.log(`Warming up with ${WARMUP_REQUESTS} discarded requests ...`);
+  try {
+    await warmUp({ notifyUrl, countUrl });
+  } catch (err) {
+    console.log(`  Warm-up failed (${err}); continuing anyway.`);
+  }
   console.log(`Firing ${requestCount} concurrent requests at ${notifyUrl} ...`);
 
   const pendingDelivery = new Map(); // request_id -> sendTs
@@ -79,6 +140,17 @@ async function runLoadTest({ label, notifyUrl, wsUrl, requestCount }) {
     return;
   }
 
+  let baselineRows = 0;
+  if (countUrl) {
+    try {
+      baselineRows = await fetchRowCount(countUrl);
+    } catch (err) {
+      console.log(`  Could not read row count from ${countUrl} (${err}); skipping persistence timing.`);
+      countUrl = null;
+    }
+  }
+  const runStartTs = Date.now();
+
   const results = await Promise.allSettled(
     Array.from({ length: requestCount }, async () => {
       const requestId = `${LOAD_TEST_PREFIX}${crypto.randomUUID()}`;
@@ -101,6 +173,11 @@ async function runLoadTest({ label, notifyUrl, wsUrl, requestCount }) {
   console.log(`  Requests: ${results.length} sent, ${succeeded.length} succeeded, ${failed} failed`);
   console.log(summarize("Client response time", responseMs));
 
+  // Runs alongside the delivery grace period below, not after it.
+  const drainPromise = countUrl
+    ? measureDrain({ countUrl, baseline: baselineRows, expected: succeeded.length, startTs: runStartTs })
+    : null;
+
   if (pendingDelivery.size > 0) {
     console.log(`  Waiting up to ${DELIVERY_GRACE_MS}ms for ${pendingDelivery.size} remaining deliveries...`);
     await new Promise((resolve) => setTimeout(resolve, DELIVERY_GRACE_MS));
@@ -108,30 +185,44 @@ async function runLoadTest({ label, notifyUrl, wsUrl, requestCount }) {
   ws.close();
 
   console.log(summarize("End-to-end delivery time", deliveryMs));
+  if (drainPromise) {
+    const drain = await drainPromise;
+    console.log(
+      drain.complete
+        ? `  Persisted to Postgres: all ${drain.persisted} rows after ${(drain.ms / 1000).toFixed(2)}s (from first request sent)`
+        : `  Persisted to Postgres: only ${drain.persisted} of ${succeeded.length} rows after ${(drain.ms / 1000).toFixed(2)}s (timed out)`
+    );
+  }
   if (pendingDelivery.size > 0) {
     console.log(`  ${pendingDelivery.size} request(s) never showed up over the WebSocket within the grace period.`);
   }
 }
 
 async function main() {
-  const { requests, path, host } = parseArgs(process.argv.slice(2));
+  const { requests, path, host, first } = parseArgs(process.argv.slice(2));
 
-  if (path === "sync" || path === "both") {
-    await runLoadTest({
-      label: "Synchronous, Request-Driven (notify-api)",
-      notifyUrl: `http://${host}:8004/notify`,
-      wsUrl: `ws://${host}:8003/ws`,
-      requestCount: requests,
-    });
-  }
+  const runs = {
+    sync: () =>
+      runLoadTest({
+        label: "Synchronous, Request-Driven (notify-api)",
+        notifyUrl: `http://${host}:8004/notify`,
+        wsUrl: `ws://${host}:8003/ws`,
+        requestCount: requests,
+      }),
+    streaming: () =>
+      runLoadTest({
+        label: "Event-Driven, Asynchronous (producer-api)",
+        notifyUrl: `http://${host}:8011/notify`,
+        wsUrl: `ws://${host}:8013/ws`,
+        requestCount: requests,
+        countUrl: `http://${host}:8002/admin/load-test-count`,
+      }),
+  };
 
-  if (path === "streaming" || path === "both") {
-    await runLoadTest({
-      label: "Event-Driven, Asynchronous (producer-api)",
-      notifyUrl: `http://${host}:8011/notify`,
-      wsUrl: `ws://${host}:8013/ws`,
-      requestCount: requests,
-    });
+  const order = path === "both" ? (first === "streaming" ? ["streaming", "sync"] : ["sync", "streaming"]) : [path];
+  for (let i = 0; i < order.length; i++) {
+    if (i > 0) await new Promise((resolve) => setTimeout(resolve, COOLDOWN_MS));
+    await runs[order[i]]();
   }
 
   console.log(
