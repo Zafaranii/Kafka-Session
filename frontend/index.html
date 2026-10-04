@@ -1,0 +1,927 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Notification Demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem; background: #f5f5f7; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+  p.subtitle { color: #555; margin-top: 0; }
+  .panels { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+  .panel { flex: 1; min-width: 480px; background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.25rem; }
+  .panel h2 { margin-top: 0; font-size: 1.1rem; }
+  .status { font-size: 0.85rem; margin-bottom: 0.75rem; }
+  .status.connected { color: #1a7a4c; }
+  .status.disconnected { color: #a33; }
+  button { padding: 0.5rem 1rem; font-size: 0.95rem; cursor: pointer; border: 1px solid #333; border-radius: 6px; background: #1a1a1a; color: #fff; }
+  button:disabled { cursor: not-allowed; background: #999; border-color: #999; }
+  .table-scroll { overflow-x: auto; margin-top: 0.75rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+  th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #eee; white-space: nowrap; }
+  /* Tighter than the load-test table: two 480px-ish panels side by side have
+     much less room than the full-width load-test results card. */
+  .panel table { font-size: 0.75rem; }
+  .panel th, .panel td { padding: 0.3rem 0.35rem; }
+  th { color: #555; font-weight: 600; }
+  td.total { font-weight: 700; }
+  td.na { color: #bbb; }
+  td.code-ok { color: #1a7a4c; font-weight: 700; }
+  td.code-err { color: #a33; font-weight: 700; }
+  td.code-err[title]:not([title=""]) { cursor: help; text-decoration: underline dotted; }
+  td[data-role="wsmsg"] { max-width: 130px; overflow: hidden; text-overflow: ellipsis; }
+  .legend { display: flex; gap: 0.9rem; flex-wrap: wrap; font-size: 0.75rem; color: #555; margin-top: 0.6rem; }
+  .legend span { display: inline-flex; align-items: center; gap: 0.3rem; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .waterfall { display: flex; height: 12px; width: 100%; min-width: 55px; border-radius: 3px; overflow: hidden; background: #f0f0f0; }
+  .waterfall div { height: 100%; }
+  .seg-1 { background: #8ecae6; }
+  .seg-2 { background: #219ebc; }
+  .seg-3 { background: #023047; }
+  .seg-4 { background: #ffb703; }
+  .toolbar { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 1rem; flex-wrap: wrap; }
+  .toolbar button { background: #fff; color: #a33; border-color: #a33; }
+  .toolbar button:disabled { color: #999; border-color: #999; background: #fff; }
+  .toolbar button.primary { background: #1a1a1a; color: #fff; border-color: #333; }
+  .toolbar button.primary:disabled { background: #999; border-color: #999; }
+  .toolbar input[type="number"] { width: 5.5rem; padding: 0.4rem 0.5rem; font-size: 0.9rem; border: 1px solid #ccc; border-radius: 6px; }
+  #load-test-status, #reset-status { font-size: 0.8rem; color: #555; }
+
+  /* Load-test results: summary line, stats table, then comparison chart. */
+  .lt-results { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 1.25rem; }
+  .lt-results h3 { margin: 0 0 0.5rem 0; font-size: 1rem; }
+  .lt-summary { display: flex; gap: 1.5rem; flex-wrap: wrap; font-size: 0.8rem; color: #555; margin-bottom: 0.75rem; }
+  .lt-error { color: #a33; font-size: 0.85rem; }
+  table.stats-table { margin-top: 0.75rem; }
+  table.stats-table th, table.stats-table td { font-variant-numeric: tabular-nums; }
+  table.stats-table td:first-child, table.stats-table th:first-child { font-variant-numeric: normal; white-space: normal; }
+  table.stats-table td.metric-label { display: flex; align-items: center; gap: 0.4rem; white-space: nowrap; }
+  table.stats-table .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; flex-shrink: 0; }
+  .series-1-swatch { background: #2a78d6; }
+  .series-2-swatch { background: #eb6834; }
+
+  /* Chart — validated categorical palette (dataviz skill): slot 1 blue =
+     Client response, slot 2 orange = End-to-end delivery. Light mode only,
+     matching the rest of this page (no dark mode elsewhere either). */
+  .viz-root {
+    --surface-1: #fcfcfb;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --gridline: #e1e0d9;
+    --baseline: #c3c2b7;
+    --series-1: #2a78d6;
+    --series-2: #eb6834;
+    margin-top: 1rem;
+  }
+  .viz-legend { display: flex; gap: 1.25rem; flex-wrap: wrap; font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.5rem; }
+  .viz-legend span { display: inline-flex; align-items: center; gap: 0.4rem; }
+  .viz-legend .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .viz-root svg { width: 100%; height: auto; display: block; }
+  .viz-root .bar { transition: opacity 0.1s; cursor: default; }
+  .viz-root .bar:hover { opacity: 0.8; }
+  .viz-root .gridline { stroke: var(--gridline); stroke-width: 1; }
+  .viz-root .baseline { stroke: var(--baseline); stroke-width: 1; }
+  .viz-root .axis-label { fill: var(--text-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+  .viz-root .category-label { fill: var(--text-secondary); font-size: 11px; }
+  .viz-root .value-label { fill: var(--text-secondary); font-size: 10px; font-variant-numeric: tabular-nums; }
+
+  .chaos-controls { display: flex; align-items: center; gap: 0.6rem; margin: 0.5rem 0 0.6rem; flex-wrap: wrap; }
+  .chaos-controls button { background: #fff; color: #a33; border-color: #a33; padding: 0.35rem 0.7rem; font-size: 0.85rem; }
+  .chaos-controls button:disabled { color: #999; border-color: #999; background: #fff; cursor: not-allowed; }
+  .chaos-status { font-size: 0.78rem; color: #555; }
+  .chaos-explainer { background: #fff7e6; border: 1px solid #f0c36d; border-radius: 6px; padding: 0.6rem 0.75rem; font-size: 0.8rem; color: #5c4a1a; margin-bottom: 0.75rem; line-height: 1.4; }
+  .chaos-explainer code { background: rgba(0, 0, 0, 0.08); padding: 0 0.25rem; border-radius: 3px; }
+
+  .retry-status { font-size: 0.78rem; margin: 0.4rem 0; padding: 0.35rem 0.6rem; border-radius: 6px; background: #fff7e6; border: 1px solid #f0c36d; color: #5c4a1a; }
+  .retry-status.retry-success { background: #eaf7ef; border-color: #8fd4ab; color: #1a7a4c; }
+  .retry-status.retry-failed { background: #fdeceb; border-color: #e2a6a1; color: #a33; }
+
+  /* Message journey: a horizontal checkpoint tracker for one message at a
+     time (the most recently sent), not a quantitative chart — a stepper. */
+  .journey-wrap { margin-top: 0.75rem; }
+  .journey-title { font-size: 0.8rem; color: #555; margin-bottom: 0.35rem; }
+  .journey-title span { font-weight: 600; color: #1a1a1a; }
+  .journey { display: flex; overflow-x: auto; padding-top: 4px; }
+  .journey-node { flex: 1; min-width: 84px; text-align: center; position: relative; padding: 0 4px; }
+  .journey-node:not(:last-child)::after { content: ""; position: absolute; top: 9px; left: 50%; width: 100%; height: 2px; background: #ddd; z-index: 0; }
+  .journey-node.reached:not(:last-child)::after { background: #1a7a4c; }
+  .journey-dot { width: 18px; height: 18px; line-height: 18px; border-radius: 50%; background: #ddd; margin: 0 auto 4px; position: relative; z-index: 1; font-size: 10px; color: #fff; }
+  .journey-node.reached .journey-dot { background: #1a7a4c; }
+  .journey-label-text { font-size: 0.68rem; color: #555; }
+  .journey-time { font-size: 0.68rem; color: #1a7a4c; font-weight: 600; }
+  .journey-node.pending .journey-time { color: #bbb; }
+</style>
+</head>
+<body>
+  <h1>Notification Demo</h1>
+  <p class="subtitle">Synchronous, Request-Driven (blocking chain) vs Event-Driven, Asynchronous Processing (Kafka-backed)</p>
+
+  <div class="toolbar">
+    <label>Requests: <input id="load-test-count" type="number" min="1" max="5000" value="1000"></label>
+    <button id="load-test-btn" class="primary">Run Load Test</button>
+    <button id="reset-btn">Reset Load Test Data</button>
+    <span id="load-test-status"></span>
+    <span id="reset-status"></span>
+  </div>
+
+  <div class="lt-results" id="load-test-results" hidden></div>
+
+  <div class="panels">
+    <div class="panel" id="sync-panel">
+      <h2>Synchronous, Request-Driven</h2>
+      <div class="status disconnected" id="sync-status">WebSocket: connecting…</div>
+      <div class="chaos-controls">
+        <button id="sync-stop-btn">Stop ws-service</button>
+        <button id="sync-start-btn" disabled>Start ws-service</button>
+        <span class="chaos-status" id="sync-chaos-status"></span>
+      </div>
+      <div class="chaos-explainer" id="sync-chaos-explainer" hidden>
+        <strong>What's happening:</strong> this stops <code>ws-service</code>,
+        which holds every browser WebSocket connection entirely in memory —
+        there is no queue or durable store behind it.
+        <code>notify-api</code> retries its push to <code>ws-service</code> a
+        few times with backoff, but once those retries are exhausted the
+        notification is gone for good. Restarting <code>ws-service</code>
+        afterwards does not recover it — send a notification now and watch
+        it fail.
+      </div>
+      <button id="sync-send">Send Notification</button>
+      <div class="retry-status" id="sync-retry-status" hidden></div>
+      <div class="legend">
+        <span><i class="swatch seg-1"></i>Browser → notify-api</span>
+        <span><i class="swatch seg-2"></i>DB write (notify-api ↔ db-service)</span>
+        <span><i class="swatch seg-3"></i>Push (notify-api ↔ ws-service)</span>
+        <span><i class="swatch seg-4"></i>Deliver (ws-service → browser)</span>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th title="Request ID">Req ID</th>
+              <th title="Browser → notify-api">→notify</th>
+              <th>DB write</th>
+              <th>→ws push</th>
+              <th>→delivered</th>
+              <th title="HTTP status code returned by /notify">Code</th>
+              <th title="Message payload received over the WebSocket">WS Msg</th>
+              <th title="Client response time">Response</th>
+              <th title="End-to-end delivery time">Delivery</th>
+              <th>Breakdown</th>
+            </tr>
+          </thead>
+          <tbody id="sync-log"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel" id="stream-panel">
+      <h2>Event-Driven, Asynchronous</h2>
+      <div class="status disconnected" id="stream-status">WebSocket: connecting…</div>
+      <div class="chaos-controls">
+        <button id="stream-stop-btn">Stop notifier-consumer</button>
+        <button id="stream-start-btn" disabled>Start notifier-consumer</button>
+        <span class="chaos-status" id="stream-chaos-status"></span>
+      </div>
+      <div class="chaos-explainer" id="stream-chaos-explainer" hidden>
+        <strong>What's happening:</strong> this stops the
+        <code>notifier-consumer</code> container while Kafka keeps accepting
+        events from <code>producer-api</code>. Because notifier-consumer
+        commits its offset to Kafka under a fixed consumer group, no message
+        is lost — delivery is only delayed. Send a notification now, then
+        restart it: the notification still arrives, just late.
+      </div>
+      <button id="stream-send">Send Notification</button>
+      <div class="legend">
+        <span><i class="swatch seg-1"></i>Browser → producer-api</span>
+        <span><i class="swatch seg-2"></i>Kafka accept (202)</span>
+        <span><i class="swatch seg-3"></i>→ notifier-consumer poll/broadcast</span>
+        <span><i class="swatch seg-4"></i>Deliver (notifier-consumer → browser)</span>
+      </div>
+      <div class="journey-wrap">
+        <div class="journey-title">Message journey <span id="stream-journey-reqid"></span></div>
+        <div class="journey" id="stream-journey" hidden></div>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th title="Request ID">Req ID</th>
+              <th title="Browser → producer-api">→producer</th>
+              <th title="Kafka accept (202)">Kafka accept</th>
+              <th title="notifier-consumer poll/broadcast">→consumer</th>
+              <th>→delivered</th>
+              <th title="HTTP status code returned by /notify">Code</th>
+              <th title="Message payload received over the WebSocket">WS Msg</th>
+              <th title="Client response time">Response</th>
+              <th title="End-to-end delivery time">Delivery</th>
+              <th>Breakdown</th>
+            </tr>
+          </thead>
+          <tbody id="stream-log"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+<script>
+function shortId(id) { return id.slice(0, 8); }
+function fmt(ms) { return ms === null || ms === undefined ? null : Math.max(0, Math.round(ms)); }
+
+// legDefs: ordered list of { label, compute(entry) => ms|null }. The two
+// headline metrics — client response time and end-to-end delivery time —
+// are reported separately (not folded into one "total") so the divergence
+// between them is visible: on the sync panel they're roughly equal (the
+// whole chain is on the critical path); on the event-driven panel client
+// response returns as soon as Kafka accepts the event, well before delivery.
+function renderMilestoneRow(entry, legDefs) {
+  const { row, sendTs, responseTs, deliverTs } = entry;
+
+  const legs = legDefs.map((def) => fmt(def.compute(entry)));
+  const clientResponseMs = responseTs !== null ? fmt(responseTs - sendTs) : null;
+  const deliveryMs = deliverTs !== null ? fmt(deliverTs - sendTs) : null;
+  // Bar scaling only — falls back to the response time if delivery hasn't
+  // landed yet, purely so the waterfall has a denominator to draw against.
+  const scale = deliveryMs !== null ? deliveryMs : clientResponseMs;
+
+  legs.forEach((val, i) => {
+    const cell = row.querySelector(`[data-role="leg-${i}"]`);
+    cell.textContent = val === null ? "…" : `${val}ms`;
+    cell.className = val === null ? "na" : "";
+  });
+
+  // Code and WS Msg are outcome indicators, not durations, so they're kept
+  // separate from clientResponseMs/deliveryMs below rather than folded into
+  // (and liable to be clobbered by) those cells.
+  // errorDetail (the failing endpoint's own explanation, e.g. "db-service
+  // unreachable: ..." vs "ws-service unreachable after 4 attempts...") is
+  // what tells apart two failures that otherwise both show up as a bare
+  // 502 - which step actually failed isn't visible from the status code
+  // alone, so it's surfaced as a tooltip rather than silently dropped.
+  const codeCell = row.querySelector('[data-role="code"]');
+  if (entry.httpStatus !== null && entry.httpStatus !== undefined) {
+    codeCell.textContent = String(entry.httpStatus);
+    codeCell.className = entry.httpStatus >= 200 && entry.httpStatus < 300 ? "code-ok" : "code-err";
+    codeCell.title = entry.errorDetail || "";
+  } else if (entry.networkError) {
+    codeCell.textContent = "ERR";
+    codeCell.className = "code-err";
+    codeCell.title = entry.errorDetail || "";
+  } else {
+    codeCell.textContent = "…";
+    codeCell.className = "na";
+    codeCell.title = "";
+  }
+
+  const wsMsgCell = row.querySelector('[data-role="wsmsg"]');
+  if (entry.wsMessage !== null && entry.wsMessage !== undefined) {
+    wsMsgCell.textContent = entry.wsMessage;
+    wsMsgCell.title = entry.wsMessage;
+    wsMsgCell.className = "";
+  } else {
+    wsMsgCell.textContent = "—";
+    wsMsgCell.className = "na";
+  }
+
+  const responseCell = row.querySelector('[data-role="response"]');
+  responseCell.textContent = clientResponseMs === null ? "…" : `${clientResponseMs}ms`;
+  responseCell.className = "total";
+
+  const deliveryCell = row.querySelector('[data-role="delivery"]');
+  deliveryCell.textContent = deliveryMs === null ? "…" : `${deliveryMs}ms`;
+  deliveryCell.className = "total";
+
+  const barCell = row.querySelector('[data-role="breakdown"]');
+  if (legs.every((l) => l !== null) && scale > 0) {
+    barCell.innerHTML = "";
+    const bar = document.createElement("div");
+    bar.className = "waterfall";
+    legs.forEach((leg, i) => {
+      const seg = document.createElement("div");
+      seg.className = `seg-${i + 1}`;
+      seg.style.width = `${Math.max(2, (leg / scale) * 100)}%`;
+      seg.title = `${legDefs[i].label}: ${leg}ms`;
+      bar.appendChild(seg);
+    });
+    barCell.appendChild(bar);
+  }
+}
+
+// Renders the "message journey": a checkpoint tracker for one message,
+// derived from the same legDefs used for the row breakdown. Each leg's
+// duration is a gap between two consecutive points in the chain, so summing
+// legs in order gives the elapsed time since send at each checkpoint —
+// that's the arithmetic this leans on, not a re-measurement of anything.
+function renderJourney(entry, legDefs, els) {
+  let cumulative = 0;
+  let blocked = false;
+  const stages = [{ label: "Browser (sent)", elapsedMs: 0, reached: true }];
+  for (const def of legDefs) {
+    const legMs = blocked ? null : def.compute(entry);
+    if (legMs === null || legMs === undefined) {
+      blocked = true;
+      stages.push({ label: def.arrival || def.label, elapsedMs: null, reached: false });
+      continue;
+    }
+    cumulative += legMs;
+    stages.push({ label: def.arrival || def.label, elapsedMs: cumulative, reached: true });
+  }
+
+  els.reqIdLabel.textContent = shortId(entry.requestId);
+  els.container.hidden = false;
+  els.container.innerHTML = stages
+    .map(
+      (s) => `
+        <div class="journey-node ${s.reached ? "reached" : "pending"}">
+          <div class="journey-dot">${s.reached ? "✓" : ""}</div>
+          <div class="journey-label-text">${s.label}</div>
+          <div class="journey-time">${s.reached ? Math.round(s.elapsedMs) + "ms" : "…"}</div>
+        </div>`
+    )
+    .join("");
+}
+
+function setupPanel({ prefix, wsUrl, notifyUrl, legDefs, journey, onSend }) {
+  const statusEl = document.getElementById(`${prefix}-status`);
+  const sendBtn = document.getElementById(`${prefix}-send`);
+  const logBody = document.getElementById(`${prefix}-log`);
+  const pending = new Map();
+
+  function updateJourney(entry) {
+    if (!journey || entry.requestId !== journey.trackedId) return;
+    renderJourney(entry, legDefs, journey.els);
+  }
+
+  function connect() {
+    const ws = new WebSocket(wsUrl);
+    ws.onopen = () => {
+      statusEl.textContent = "WebSocket: connected";
+      statusEl.className = "status connected";
+    };
+    ws.onclose = () => {
+      statusEl.textContent = "WebSocket: disconnected — retrying…";
+      statusEl.className = "status disconnected";
+      setTimeout(connect, 1500);
+    };
+    ws.onerror = () => ws.close();
+    ws.onmessage = (evt) => {
+      const data = JSON.parse(evt.data);
+      const entry = pending.get(data.request_id);
+      if (!entry) return;
+      entry.deliverTs = Date.now();
+      entry.broadcastAt = data.broadcast_at ?? null;
+      entry.wsMessage = data.message ?? null;
+      renderMilestoneRow(entry, legDefs);
+      updateJourney(entry);
+      if (entry.timeline !== null) pending.delete(data.request_id);
+    };
+  }
+  connect();
+
+  sendBtn.addEventListener("click", async () => {
+    const requestId = crypto.randomUUID();
+    const message = `Hello at ${new Date().toLocaleTimeString()}`;
+    const sendTs = Date.now();
+
+    const row = document.createElement("tr");
+    row.innerHTML = `
+      <td data-role="reqid">${shortId(requestId)}</td>
+      ${legDefs.map((_, i) => `<td data-role="leg-${i}">…</td>`).join("")}
+      <td data-role="code">…</td>
+      <td data-role="wsmsg">—</td>
+      <td data-role="response">…</td>
+      <td data-role="delivery">…</td>
+      <td data-role="breakdown"></td>
+    `;
+    logBody.prepend(row);
+
+    // httpStatus/networkError/wsMessage are outcome indicators (Code and WS
+    // Msg columns) - separate from timeline/deliverTs, which drive the
+    // duration columns. Keeping them separate is what avoids one cell's
+    // render clobbering another's (see renderMilestoneRow).
+    const entry = {
+      requestId, row, sendTs,
+      timeline: null, responseTs: null, deliverTs: null, broadcastAt: null,
+      httpStatus: null, networkError: false, wsMessage: null, errorDetail: null,
+    };
+    pending.set(requestId, entry);
+
+    if (journey) {
+      journey.trackedId = requestId;
+      updateJourney(entry);
+    }
+    if (onSend) onSend(requestId);
+
+    try {
+      // responseTs: when the client's request actually resolves — the
+      // "client response time" metric. Not the same as delivery: on the
+      // event-driven panel this fires as soon as Kafka accepts the event
+      // (202), well before the notification is actually delivered.
+      const resp = await fetch(notifyUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ request_id: requestId, message }),
+      });
+      entry.responseTs = Date.now();
+      entry.httpStatus = resp.status;
+      if (resp.ok) {
+        const data = await resp.json();
+        entry.timeline = data.timeline;
+      } else {
+        // FastAPI's HTTPException body is {"detail": "..."} - this is what
+        // actually distinguishes "db-service unreachable" from "ws-service
+        // unreachable after 4 attempts", which an HTTP status code alone
+        // (both 502) can't tell apart.
+        try {
+          const data = await resp.json();
+          entry.errorDetail = data.detail ?? null;
+        } catch {
+          entry.errorDetail = null;
+        }
+      }
+      renderMilestoneRow(entry, legDefs);
+      updateJourney(entry);
+      // A non-ok response means the push never succeeded, so no WebSocket
+      // delivery will ever arrive for this request - safe to stop tracking
+      // it rather than leaving it in `pending` forever.
+      if (entry.deliverTs !== null || !resp.ok) pending.delete(requestId);
+    } catch (err) {
+      entry.responseTs = Date.now();
+      entry.networkError = true;
+      entry.errorDetail = String(err);
+      renderMilestoneRow(entry, legDefs);
+      updateJourney(entry);
+      pending.delete(requestId);
+    }
+  });
+}
+
+// Live retry status (sync path only): notify-api broadcasts each push
+// attempt over its own WebSocket (/status-ws), separate from ws-service's —
+// ws-service is the thing that's down during this demo, so the retry loop's
+// progress can't ride along on that connection. Tracks only the most
+// recently sent request_id so a concurrent load test doesn't flood it.
+const syncRetryTracker = { requestId: null };
+
+function setupRetryStatus({ statusUrl, tracker, statusElId }) {
+  const statusEl = document.getElementById(statusElId);
+
+  function connect() {
+    const ws = new WebSocket(statusUrl);
+    ws.onmessage = (evt) => {
+      let data;
+      try {
+        data = JSON.parse(evt.data);
+      } catch {
+        return;
+      }
+      if (data.request_id !== tracker.requestId) return;
+
+      statusEl.hidden = false;
+      statusEl.classList.remove("retry-success", "retry-failed");
+
+      if (data.type === "attempt" && data.status === "trying") {
+        statusEl.textContent = `Push attempt ${data.attempt}/${data.max_attempts}…`;
+      } else if (data.type === "attempt" && data.status === "failed") {
+        statusEl.textContent = `Push attempt ${data.attempt}/${data.max_attempts} failed`;
+      } else if (data.type === "attempt" && data.status === "success") {
+        statusEl.textContent = `Push attempt ${data.attempt}/${data.max_attempts} succeeded`;
+        statusEl.classList.add("retry-success");
+      } else if (data.type === "waiting") {
+        statusEl.textContent = `Retrying in ${data.delay_ms}ms… (attempt ${data.next_attempt}/${data.max_attempts})`;
+      } else if (data.type === "exhausted") {
+        statusEl.textContent = `All ${data.max_attempts} attempts failed — message lost`;
+        statusEl.classList.add("retry-failed");
+      }
+    };
+    ws.onclose = () => setTimeout(connect, 1500);
+    ws.onerror = () => ws.close();
+  }
+  connect();
+}
+
+setupRetryStatus({
+  statusUrl: `ws://${location.hostname}:8004/status-ws`,
+  tracker: syncRetryTracker,
+  statusElId: "sync-retry-status",
+});
+
+setupPanel({
+  prefix: "sync",
+  wsUrl: `ws://${location.hostname}:8003/ws`,
+  notifyUrl: `http://${location.hostname}:8004/notify`,
+  legDefs: [
+    { label: "Browser→notify-api", compute: (e) => e.timeline ? e.timeline.received_at - e.sendTs : null },
+    { label: "DB write", compute: (e) => e.timeline ? e.timeline.db_write_done_at - e.timeline.received_at : null },
+    { label: "→ws push", compute: (e) => e.timeline ? e.timeline.ws_push_done_at - e.timeline.db_write_done_at : null },
+    { label: "→delivered", compute: (e) => (e.deliverTs !== null && e.broadcastAt !== null) ? e.deliverTs - e.broadcastAt : null },
+  ],
+  onSend: (requestId) => {
+    syncRetryTracker.requestId = requestId;
+    const el = document.getElementById("sync-retry-status");
+    el.hidden = true;
+    el.classList.remove("retry-success", "retry-failed");
+  },
+});
+
+// Stop/Start buttons for the resilience-vs-loss demo: neither the browser
+// nor notifier-consumer/ws-service can control their own container, so
+// these calls go through control-api (services/control-api), which has the
+// Docker socket mounted in and is scoped to just these two containers.
+const CONTROL_API = `http://${location.hostname}:8099`;
+
+function setupChaosControls({ prefix, controlName }) {
+  const stopBtn = document.getElementById(`${prefix}-stop-btn`);
+  const startBtn = document.getElementById(`${prefix}-start-btn`);
+  const statusEl = document.getElementById(`${prefix}-chaos-status`);
+  const explainerEl = document.getElementById(`${prefix}-chaos-explainer`);
+
+  function applyStatus(status) {
+    const running = status === "running";
+    statusEl.textContent = `${controlName}: ${status}`;
+    stopBtn.disabled = !running;
+    startBtn.disabled = running;
+    explainerEl.hidden = running;
+  }
+
+  async function refreshStatus() {
+    try {
+      const resp = await fetch(`${CONTROL_API}/containers/${controlName}/status`);
+      const data = await resp.json();
+      applyStatus(data.status);
+    } catch (err) {
+      statusEl.textContent = "control-api unreachable";
+    }
+  }
+
+  stopBtn.addEventListener("click", async () => {
+    stopBtn.disabled = true;
+    statusEl.textContent = "stopping…";
+    try {
+      const resp = await fetch(`${CONTROL_API}/containers/${controlName}/stop`, { method: "POST" });
+      const data = await resp.json();
+      applyStatus(data.status);
+    } catch (err) {
+      statusEl.textContent = `stop failed: ${err}`;
+      stopBtn.disabled = false;
+    }
+  });
+
+  startBtn.addEventListener("click", async () => {
+    startBtn.disabled = true;
+    statusEl.textContent = "starting…";
+    try {
+      const resp = await fetch(`${CONTROL_API}/containers/${controlName}/start`, { method: "POST" });
+      const data = await resp.json();
+      applyStatus(data.status);
+    } catch (err) {
+      statusEl.textContent = `start failed: ${err}`;
+      startBtn.disabled = false;
+    }
+  });
+
+  refreshStatus();
+}
+
+setupChaosControls({ prefix: "sync", controlName: "ws-service" });
+setupChaosControls({ prefix: "stream", controlName: "notifier-consumer" });
+
+const streamJourney = {
+  trackedId: null,
+  els: {
+    container: document.getElementById("stream-journey"),
+    reqIdLabel: document.getElementById("stream-journey-reqid"),
+  },
+};
+
+setupPanel({
+  prefix: "stream",
+  wsUrl: `ws://${location.hostname}:8013/ws`,
+  notifyUrl: `http://${location.hostname}:8011/notify`,
+  legDefs: [
+    { label: "Browser→producer-api", arrival: "producer-api", compute: (e) => e.timeline ? e.timeline.received_at - e.sendTs : null },
+    { label: "Kafka accept (202)", arrival: "Kafka topic", compute: (e) => e.timeline ? e.timeline.produced_at - e.timeline.received_at : null },
+    { label: "→consumer poll/broadcast", arrival: "notifier-consumer", compute: (e) => (e.timeline && e.broadcastAt !== null) ? e.broadcastAt - e.timeline.produced_at : null },
+    { label: "→delivered", arrival: "Browser (delivered)", compute: (e) => (e.deliverTs !== null && e.broadcastAt !== null) ? e.deliverTs - e.broadcastAt : null },
+  ],
+  journey: streamJourney,
+});
+
+// In-browser load test — same approach as scripts/load-test.mjs, just run
+// from the page itself: fire N concurrent requests at a panel's /notify
+// endpoint over a dedicated WebSocket connection (separate from the panel's
+// own, so this never touches the per-click "Send Notification" log table),
+// tag request_ids with LOAD_TEST_PREFIX so "Reset Load Test Data" can clean
+// them up, and report client-response vs end-to-end-delivery percentiles.
+const LOAD_TEST_PREFIX = "loadtest-";
+const DELIVERY_GRACE_MS = 12000;
+
+function percentile(sorted, p) {
+  if (sorted.length === 0) return null;
+  const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
+  return sorted[idx];
+}
+
+function summarizeStats(values) {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  return {
+    n: sorted.length,
+    min: sorted[0],
+    p50: percentile(sorted, 50),
+    p90: percentile(sorted, 90),
+    p95: percentile(sorted, 95),
+    p99: percentile(sorted, 99),
+    max: sorted[sorted.length - 1],
+  };
+}
+
+function fmtStats(s) {
+  if (!s) return "no data";
+  const r = (n) => Math.round(n);
+  return `n=${s.n} · min ${r(s.min)}ms · p50 ${r(s.p50)}ms · p90 ${r(s.p90)}ms · p95 ${r(s.p95)}ms · p99 ${r(s.p99)}ms · max ${r(s.max)}ms`;
+}
+
+async function runLoadTestForPanel({ label, notifyUrl, wsUrl, requestCount }) {
+  const pendingDelivery = new Map();
+  const deliveryMs = [];
+
+  const ws = new WebSocket(wsUrl);
+  const wsReady = new Promise((resolve, reject) => {
+    ws.addEventListener("open", resolve);
+    ws.addEventListener("error", reject);
+  });
+  ws.addEventListener("message", (evt) => {
+    let data;
+    try {
+      data = JSON.parse(evt.data);
+    } catch {
+      return;
+    }
+    const sendTs = pendingDelivery.get(data.request_id);
+    if (sendTs === undefined) return;
+    deliveryMs.push(Date.now() - sendTs);
+    pendingDelivery.delete(data.request_id);
+  });
+
+  try {
+    await wsReady;
+  } catch (err) {
+    return { label, error: `Could not connect to ${wsUrl}` };
+  }
+
+  const results = await Promise.allSettled(
+    Array.from({ length: requestCount }, async () => {
+      const requestId = `${LOAD_TEST_PREFIX}${crypto.randomUUID()}`;
+      const sendTs = Date.now();
+      pendingDelivery.set(requestId, sendTs);
+      const resp = await fetch(notifyUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ request_id: requestId, message: "load test" }),
+      });
+      return { status: resp.status, responseMs: Date.now() - sendTs };
+    })
+  );
+
+  const succeeded = results.filter((r) => r.status === "fulfilled" && r.value.status >= 200 && r.value.status < 300);
+  const failed = results.length - succeeded.length;
+  const responseMs = succeeded.map((r) => r.value.responseMs);
+
+  if (pendingDelivery.size > 0) {
+    await new Promise((resolve) => setTimeout(resolve, DELIVERY_GRACE_MS));
+  }
+  ws.close();
+
+  return {
+    label,
+    sent: results.length,
+    succeeded: succeeded.length,
+    failed,
+    undelivered: pendingDelivery.size,
+    responseStats: summarizeStats(responseMs),
+    deliveryStats: summarizeStats(deliveryMs),
+  };
+}
+
+// Rounds a value up to a "nice" axis max (1/2/5 x 10^n) so gridlines land on
+// clean numbers instead of the raw max.
+function niceCeil(value) {
+  if (!(value > 0)) return 10;
+  const magnitude = Math.pow(10, Math.floor(Math.log10(value)));
+  const normalized = value / magnitude;
+  const step = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
+  return step * magnitude;
+}
+
+// 4px rounded top corners, square baseline — see marks-and-anatomy spec.
+function roundedTopRectPath(x, y, w, h, r) {
+  r = Math.min(r, w / 2, Math.max(h, 0));
+  if (h <= 0) return `M${x},${y} L${x + w},${y} Z`;
+  return (
+    `M${x},${y + h} L${x},${y + r} Q${x},${y} ${x + r},${y} ` +
+    `L${x + w - r},${y} Q${x + w},${y} ${x + w},${y + r} L${x + w},${y + h} Z`
+  );
+}
+
+function buildStatsTableRows(resultsArr) {
+  const metricRow = (pathLabel, metricLabel, swatchClass, stats) => {
+    if (!stats) return "";
+    const c = (n) => `<td>${Math.round(n)}</td>`;
+    return `
+      <tr>
+        <td>${pathLabel}</td>
+        <td class="metric-label"><i class="swatch ${swatchClass}"></i>${metricLabel}</td>
+        <td>${stats.n}</td>
+        ${c(stats.min)}${c(stats.p50)}${c(stats.p90)}${c(stats.p95)}${c(stats.p99)}${c(stats.max)}
+      </tr>
+    `;
+  };
+  return resultsArr
+    .filter((r) => !r.error)
+    .map(
+      (r) =>
+        metricRow(r.label, "Client response", "series-1-swatch", r.responseStats) +
+        metricRow(r.label, "End-to-end delivery", "series-2-swatch", r.deliveryStats)
+    )
+    .join("");
+}
+
+// Grouped bar chart: one group per path, two bars per group (p50 client
+// response vs p50 end-to-end delivery) — the divergence between the two
+// bars within a group *is* the "removed from the critical path" claim.
+function buildComparisonChartSVG(resultsArr) {
+  const points = resultsArr
+    .filter((r) => !r.error && r.responseStats && r.deliveryStats)
+    .map((r) => ({
+      category: r.label,
+      response: r.responseStats.p50,
+      delivery: r.deliveryStats.p50,
+    }));
+  if (points.length === 0) return "";
+
+  const width = 640;
+  const height = 260;
+  const marginLeft = 56;
+  const marginRight = 20;
+  const marginTop = 16;
+  const marginBottom = 34;
+  const plotW = width - marginLeft - marginRight;
+  const plotH = height - marginTop - marginBottom;
+  const baselineY = marginTop + plotH;
+
+  const maxVal = Math.max(...points.flatMap((p) => [p.response, p.delivery]));
+  const axisMax = niceCeil(maxVal || 1);
+  const yScale = (v) => plotH * (v / axisMax);
+
+  const groupW = plotW / points.length;
+  const barW = 24;
+  const barGap = 2;
+
+  const gridlineCount = 4;
+  let gridlines = "";
+  for (let i = 0; i <= gridlineCount; i++) {
+    const v = (axisMax / gridlineCount) * i;
+    const y = baselineY - yScale(v);
+    gridlines += `<line class="gridline" x1="${marginLeft}" y1="${y}" x2="${width - marginRight}" y2="${y}"/>`;
+    gridlines += `<text class="axis-label" x="${marginLeft - 8}" y="${y + 3}" text-anchor="end">${Math.round(v)}</text>`;
+  }
+
+  let bars = "";
+  let categoryLabels = "";
+  points.forEach((p, i) => {
+    const groupCenterX = marginLeft + groupW * i + groupW / 2;
+    const pairW = barW * 2 + barGap;
+    const x1 = groupCenterX - pairW / 2;
+    const x2 = x1 + barW + barGap;
+
+    const hResponse = yScale(p.response);
+    const hDelivery = yScale(p.delivery);
+    const yResponse = baselineY - hResponse;
+    const yDelivery = baselineY - hDelivery;
+
+    bars += `
+      <path class="bar" fill="var(--series-1)" d="${roundedTopRectPath(x1, yResponse, barW, hResponse, 4)}">
+        <title>${p.category} — Client response (p50): ${Math.round(p.response)}ms</title>
+      </path>
+      <text class="value-label" x="${x1 + barW / 2}" y="${yResponse - 6}" text-anchor="middle">${Math.round(p.response)}</text>
+      <path class="bar" fill="var(--series-2)" d="${roundedTopRectPath(x2, yDelivery, barW, hDelivery, 4)}">
+        <title>${p.category} — End-to-end delivery (p50): ${Math.round(p.delivery)}ms</title>
+      </path>
+      <text class="value-label" x="${x2 + barW / 2}" y="${yDelivery - 6}" text-anchor="middle">${Math.round(p.delivery)}</text>
+    `;
+    categoryLabels += `<text class="category-label" x="${groupCenterX}" y="${baselineY + 20}" text-anchor="middle">${p.category}</text>`;
+  });
+
+  return `
+    <div class="viz-legend">
+      <span><i class="swatch" style="background:var(--series-1)"></i>Client response (p50)</span>
+      <span><i class="swatch" style="background:var(--series-2)"></i>End-to-end delivery (p50)</span>
+    </div>
+    <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Client response vs end-to-end delivery time, p50, by path">
+      ${gridlines}
+      <line class="baseline" x1="${marginLeft}" y1="${baselineY}" x2="${width - marginRight}" y2="${baselineY}"/>
+      ${bars}
+      ${categoryLabels}
+    </svg>
+  `;
+}
+
+function renderLoadTestResults(resultsArr) {
+  const container = document.getElementById("load-test-results");
+  container.hidden = false;
+
+  const errors = resultsArr
+    .filter((r) => r.error)
+    .map((r) => `<p class="lt-error">${r.label}: ${r.error}</p>`)
+    .join("");
+
+  const summary = resultsArr
+    .filter((r) => !r.error)
+    .map(
+      (r) =>
+        `<span><strong>${r.label}</strong>: ${r.sent} sent, ${r.succeeded} succeeded, ${r.failed} failed${
+          r.undelivered ? `, ${r.undelivered} undelivered` : ""
+        }</span>`
+    )
+    .join("");
+
+  const tableRows = buildStatsTableRows(resultsArr);
+  const chart = buildComparisonChartSVG(resultsArr);
+
+  container.innerHTML = `
+    <h3>Load Test Results</h3>
+    ${errors}
+    <div class="lt-summary">${summary}</div>
+    ${
+      tableRows
+        ? `<table class="stats-table">
+      <thead>
+        <tr><th>Path</th><th>Metric</th><th>n</th><th>min</th><th>p50</th><th>p90</th><th>p95</th><th>p99</th><th>max</th></tr>
+      </thead>
+      <tbody>${tableRows}</tbody>
+    </table>`
+        : ""
+    }
+    ${chart ? `<div class="viz-root">${chart}</div>` : ""}
+  `;
+}
+
+const loadTestBtn = document.getElementById("load-test-btn");
+const loadTestCountInput = document.getElementById("load-test-count");
+const loadTestStatus = document.getElementById("load-test-status");
+
+loadTestBtn.addEventListener("click", async () => {
+  const requestCount = Math.max(1, Math.min(5000, parseInt(loadTestCountInput.value, 10) || 1000));
+  loadTestBtn.disabled = true;
+  resetBtn.disabled = true;
+  document.getElementById("load-test-results").hidden = true;
+
+  loadTestStatus.textContent = `Running ${requestCount} requests against the sync path…`;
+  const syncResult = await runLoadTestForPanel({
+    label: "Synchronous, Request-Driven",
+    notifyUrl: `http://${location.hostname}:8004/notify`,
+    wsUrl: `ws://${location.hostname}:8003/ws`,
+    requestCount,
+  });
+
+  loadTestStatus.textContent = `Running ${requestCount} requests against the event-driven path…`;
+  const streamResult = await runLoadTestForPanel({
+    label: "Event-Driven, Asynchronous",
+    notifyUrl: `http://${location.hostname}:8011/notify`,
+    wsUrl: `ws://${location.hostname}:8013/ws`,
+    requestCount,
+  });
+
+  loadTestStatus.textContent = 'Done — click "Reset Load Test Data" to clean up.';
+  renderLoadTestResults([syncResult, streamResult]);
+  loadTestBtn.disabled = false;
+  resetBtn.disabled = false;
+});
+
+// db-service owns the only Postgres connection in this demo, so it's where
+// the load-test cleanup endpoint lives (see services/sync/db-service/main.py)
+// even though it also deletes stream_notifications rows.
+const resetBtn = document.getElementById("reset-btn");
+const resetStatus = document.getElementById("reset-status");
+resetBtn.addEventListener("click", async () => {
+  resetBtn.disabled = true;
+  loadTestBtn.disabled = true;
+  resetStatus.textContent = "Resetting…";
+  try {
+    const resp = await fetch(`http://${location.hostname}:8002/admin/reset-load-test`, { method: "POST" });
+    const data = await resp.json();
+    if (resp.ok) {
+      resetStatus.textContent = `Removed ${data.sync_notifications_deleted} sync + ${data.stream_notifications_deleted} streaming row(s).`;
+    } else {
+      resetStatus.textContent = `Reset failed: ${data.detail ?? resp.status}`;
+    }
+  } catch (err) {
+    resetStatus.textContent = `Reset failed: ${err}`;
+  } finally {
+    resetBtn.disabled = false;
+    loadTestBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

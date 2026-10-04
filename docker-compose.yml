@@ -1,0 +1,193 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: notification-demo-postgres
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_DB: notifdb
+      POSTGRES_USER: notifuser
+      POSTGRES_PASSWORD: notifpass
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notifuser -d notifdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  db-service:
+    build: ./services/sync/db-service
+    container_name: notification-demo-db-service
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: notifdb
+      POSTGRES_USER: notifuser
+      POSTGRES_PASSWORD: notifpass
+    ports:
+      - "8002:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  ws-service:
+    build: ./services/sync/ws-service
+    container_name: notification-demo-ws-service
+    ports:
+      - "8003:8000"
+
+  notify-api:
+    build: ./services/sync/notify-api
+    container_name: notification-demo-notify-api
+    environment:
+      DB_SERVICE_URL: http://db-service:8000
+      WS_SERVICE_URL: http://ws-service:8000
+    ports:
+      - "8004:8000"
+    depends_on:
+      - db-service
+      - ws-service
+
+  # Demo-only: lets the frontend's Stop/Start buttons control ws-service and
+  # notifier-consumer directly, to show the resilience/message-loss
+  # contrast between the two paths. See services/control-api/README.md.
+  control-api:
+    build: ./services/control-api
+    container_name: notification-demo-control-api
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8099:8000"
+
+  frontend:
+    image: python:3.12-slim
+    container_name: notification-demo-frontend
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    command: ["python", "-m", "http.server", "8090"]
+    ports:
+      - "8090:8090"
+
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: notification-demo-kafka
+    hostname: broker
+    ports:
+      - "9094:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://broker:19092,CONTROLLER://broker:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:19092,PLAINTEXT_HOST://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker:29093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created explicitly by kafka-init below, not implicitly on
+      # first produce — see README.md#topic-creation for why.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: "notification-demo-cluster-1"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server broker:19092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-shot job: creates notification-requests with the minimum viable
+  # config for a single-broker demo, then exits. See README.md#topic-creation.
+  kafka-init:
+    image: apache/kafka:3.7.0
+    container_name: notification-demo-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/opt/kafka/bin/kafka-topics.sh"]
+    command:
+      - "--create"
+      - "--if-not-exists"
+      - "--topic"
+      - "notification-requests"
+      - "--bootstrap-server"
+      - "broker:19092"
+      - "--partitions"
+      - "1"
+      - "--replication-factor"
+      - "1"
+    restart: "no"
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: notification-demo-kafka-ui
+    depends_on:
+      - kafka
+      - kafka-connect
+    ports:
+      - "8081:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: notification-demo
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: broker:19092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
+
+  kafka-connect:
+    build: ./kafka-connect
+    container_name: notification-demo-kafka-connect
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8084:8083"
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: broker:19092
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      # Not just the port the worker binds to — the image's own
+      # healthcheck.sh reads this var to build its check URL and reports
+      # unhealthy (HTTP state "000") without it, even though the worker
+      # itself is up and serving fine on the default port regardless.
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: notification-demo-connect
+      CONNECT_CONFIG_STORAGE_TOPIC: connect_configs
+      CONNECT_OFFSET_STORAGE_TOPIC: connect_offsets
+      CONNECT_STATUS_STORAGE_TOPIC: connect_statuses
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "true"
+      CONNECT_PLUGIN_PATH: /usr/share/confluent-hub-components
+
+  producer-api:
+    build: ./services/streaming/producer-api
+    container_name: notification-demo-producer-api
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: broker:19092
+      NOTIFICATION_TOPIC: notification-requests
+    ports:
+      - "8011:8000"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  notifier-consumer:
+    build: ./services/streaming/notifier-consumer
+    container_name: notification-demo-notifier-consumer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: broker:19092
+      NOTIFICATION_TOPIC: notification-requests
+      KAFKA_GROUP_ID: notifier-consumer
+    ports:
+      - "8013:8000"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully

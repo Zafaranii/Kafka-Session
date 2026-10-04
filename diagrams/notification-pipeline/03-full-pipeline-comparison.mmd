@@ -1,0 +1,53 @@
+---
+title: "Notification Demo: Synchronous Request-Driven vs Event-Driven Asynchronous Processing — Phase 2 (+Avro / Schema Registry)"
+---
+flowchart TB
+    subgraph MS["Synchronous, Request-Driven (blocking chain) — unchanged"]
+        direction LR
+        B1["Browser"]
+        NA["notify-api"]
+        DB["db-service"]
+        WS["ws-service"]
+        B1 -->|"1: POST /notify"| NA
+        NA -->|"2: POST /write"| DB
+        DB -->|"3: 200 OK (row inserted)"| NA
+        NA -->|"4: POST /push"| WS
+        WS -.->|"5: WebSocket (delivered)"| B1
+        WS -->|"6: 200 OK"| NA
+        NA -->|"7: 200 OK (whole chain done)"| B1
+    end
+
+    subgraph ES["Event-Driven, Asynchronous (Kafka-backed) — Phase 2: +Avro / Schema Registry"]
+        direction LR
+        B2["Browser"]
+        PA["producer-api"]
+        SR[("Schema Registry")]
+        K[["Kafka: notification-requests"]]
+        SC["JDBC Sink Connector"]
+        PG[("Postgres")]
+        NC["notifier-consumer"]
+        B2 -->|"1: POST /notify"| PA
+        PA -->|"register/lookup schema id"| SR
+        PA -->|"2: produce (Avro)"| K
+        PA -->|"3: 202 Accepted (event published, near-instant)"| B2
+        K -->|"poll (group A)"| SC
+        SC -->|"fetch schema by id"| SR
+        SC --> PG
+        K -->|"poll (group B)"| NC
+        NC -->|"fetch schema by id"| SR
+        NC -.->|"WebSocket (delivered)"| B2
+    end
+
+    MS ~~~ ES
+
+    classDef browser fill:#E8E4F7,stroke:#5b4b8a,color:#222;
+    classDef sync fill:#FADBD8,stroke:#a33,color:#222;
+    classDef stream fill:#D5F5E3,stroke:#1a7a4c,color:#222;
+    classDef sink fill:#FDEBD0,stroke:#a67c00,color:#222;
+    classDef registry fill:#EBDEF0,stroke:#7d3c98,color:#222;
+
+    class B1,B2 browser;
+    class NA,DB,WS sync;
+    class PA,K,NC stream;
+    class SC,PG sink;
+    class SR registry;

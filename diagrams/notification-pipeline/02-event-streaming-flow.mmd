@@ -1,0 +1,18 @@
+sequenceDiagram
+    participant B as Browser
+    participant PA as producer-api
+    participant K as Kafka: notification-requests
+    participant SC as JDBC Sink Connector
+    participant PG as Postgres
+    participant NC as notifier-consumer
+
+    B->>PA: POST /notify
+    PA->>K: produce (JSON w/ inline schema)
+    PA-->>B: 202 Accepted (event published, near-instant)
+    par DB write (independent consumer group)
+        K->>SC: poll
+        SC->>PG: UPSERT stream_notifications
+    and Notification delivery (independent consumer group)
+        K->>NC: poll
+        NC-->>B: WebSocket message (delivered)
+    end

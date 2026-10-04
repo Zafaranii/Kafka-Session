@@ -1,0 +1,19 @@
+sequenceDiagram
+    participant B as Browser
+    participant NA as notify-api
+    participant DB as db-service
+    participant WS as ws-service
+
+    B->>NA: POST /notify
+    activate NA
+    NA->>DB: POST /write
+    activate DB
+    DB-->>NA: 200 OK (row inserted)
+    deactivate DB
+    NA->>WS: POST /push
+    activate WS
+    WS-->>B: WebSocket message (delivered)
+    WS-->>NA: 200 OK
+    deactivate WS
+    NA-->>B: 200 OK (whole chain done)
+    deactivate NA
