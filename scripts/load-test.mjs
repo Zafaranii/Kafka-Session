@@ -13,7 +13,11 @@
 // touching notifications sent manually through the UI.
 //
 // Usage:
-//   node scripts/load-test.mjs [--requests 1000] [--path both|sync|streaming] [--host localhost] [--first sync|streaming]
+//   node scripts/load-test.mjs [--requests 1000] [--path both|sync|streaming] [--host localhost] [--first sync|streaming] [--concurrency N]
+//
+// --concurrency caps how many requests are in flight at once (default: all of
+// them). The frontend's in-browser load test uses 500, because Chrome rejects
+// requests past its per-tab budget - pass --concurrency 500 to match it.
 //
 // Fairness: both paths get the same warm-up, the same cooldown gap, the same
 // request count and the same client. --first swaps which path runs first.
@@ -26,13 +30,14 @@ const WARMUP_REQUESTS = 200; // discarded requests per path, so JIT / connection
 const COOLDOWN_MS = 3000; // idle gap between paths so one path's leftover work can't skew the next
 
 function parseArgs(argv) {
-  const args = { requests: 1000, path: "both", host: "localhost", first: "sync" };
+  const args = { requests: 1000, path: "both", host: "localhost", first: "sync", concurrency: Infinity };
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i];
     if (key === "--requests") args.requests = parseInt(argv[++i], 10);
     else if (key === "--path") args.path = argv[++i];
     else if (key === "--host") args.host = argv[++i];
     else if (key === "--first") args.first = argv[++i]; // which path runs first when --path both (run twice, swapping, to rule out order bias)
+    else if (key === "--concurrency") args.concurrency = parseInt(argv[++i], 10);
   }
   return args;
 }
@@ -53,6 +58,25 @@ function summarize(label, values) {
     `p90=${fmt(percentile(sorted, 90))} p95=${fmt(percentile(sorted, 95))} ` +
     `p99=${fmt(percentile(sorted, 99))} max=${fmt(sorted[sorted.length - 1])}`
   );
+}
+
+// Runs task(i) for i in [0, count) with at most `limit` in flight, returning
+// results in the same shape as Promise.allSettled.
+async function runPool(count, limit, task) {
+  const results = new Array(count);
+  let next = 0;
+  async function worker() {
+    while (next < count) {
+      const i = next++;
+      try {
+        results[i] = { status: "fulfilled", value: await task(i) };
+      } catch (reason) {
+        results[i] = { status: "rejected", reason };
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, count) }, worker));
+  return results;
 }
 
 async function fetchRowCount(countUrl) {
@@ -84,17 +108,15 @@ async function measureDrain({ countUrl, baseline, expected, startTs }) {
 // Fires WARMUP_REQUESTS and throws the results away. For the streaming path it
 // also waits for the sink connector to finish persisting them, so warm-up rows
 // don't leak into the measured run's row-count baseline.
-async function warmUp({ notifyUrl, countUrl }) {
+async function warmUp({ notifyUrl, countUrl, concurrency }) {
   const baseline = countUrl ? await fetchRowCount(countUrl).catch(() => null) : null;
   const startTs = Date.now();
-  const results = await Promise.allSettled(
-    Array.from({ length: WARMUP_REQUESTS }, () =>
-      fetch(notifyUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ request_id: `${LOAD_TEST_PREFIX}${crypto.randomUUID()}`, message: "warmup" }),
-      })
-    )
+  const results = await runPool(WARMUP_REQUESTS, concurrency, () =>
+    fetch(notifyUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: `${LOAD_TEST_PREFIX}${crypto.randomUUID()}`, message: "warmup" }),
+    })
   );
   const ok = results.filter((r) => r.status === "fulfilled" && r.value.status >= 200 && r.value.status < 300).length;
   if (countUrl && baseline !== null) {
@@ -102,15 +124,16 @@ async function warmUp({ notifyUrl, countUrl }) {
   }
 }
 
-async function runLoadTest({ label, notifyUrl, wsUrl, requestCount, countUrl }) {
+async function runLoadTest({ label, notifyUrl, wsUrl, requestCount, countUrl, concurrency }) {
   console.log(`\n=== ${label} ===`);
   console.log(`Warming up with ${WARMUP_REQUESTS} discarded requests ...`);
   try {
-    await warmUp({ notifyUrl, countUrl });
+    await warmUp({ notifyUrl, countUrl, concurrency });
   } catch (err) {
     console.log(`  Warm-up failed (${err}); continuing anyway.`);
   }
-  console.log(`Firing ${requestCount} concurrent requests at ${notifyUrl} ...`);
+  const inFlight = Number.isFinite(concurrency) ? `, at most ${concurrency} in flight,` : " concurrent";
+  console.log(`Firing ${requestCount}${inFlight} requests at ${notifyUrl} ...`);
 
   const pendingDelivery = new Map(); // request_id -> sendTs
   const deliveryMs = [];
@@ -151,20 +174,18 @@ async function runLoadTest({ label, notifyUrl, wsUrl, requestCount, countUrl }) 
   }
   const runStartTs = Date.now();
 
-  const results = await Promise.allSettled(
-    Array.from({ length: requestCount }, async () => {
-      const requestId = `${LOAD_TEST_PREFIX}${crypto.randomUUID()}`;
-      const sendTs = Date.now();
-      pendingDelivery.set(requestId, sendTs);
-      const resp = await fetch(notifyUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ request_id: requestId, message: "load test" }),
-      });
-      const responseMs = Date.now() - sendTs;
-      return { status: resp.status, responseMs };
-    })
-  );
+  const results = await runPool(requestCount, concurrency, async () => {
+    const requestId = `${LOAD_TEST_PREFIX}${crypto.randomUUID()}`;
+    const sendTs = Date.now();
+    pendingDelivery.set(requestId, sendTs);
+    const resp = await fetch(notifyUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: requestId, message: "load test" }),
+    });
+    const responseMs = Date.now() - sendTs;
+    return { status: resp.status, responseMs };
+  });
 
   const succeeded = results.filter((r) => r.status === "fulfilled" && r.value.status >= 200 && r.value.status < 300);
   const failed = results.length - succeeded.length;
@@ -199,7 +220,7 @@ async function runLoadTest({ label, notifyUrl, wsUrl, requestCount, countUrl }) 
 }
 
 async function main() {
-  const { requests, path, host, first } = parseArgs(process.argv.slice(2));
+  const { requests, path, host, first, concurrency } = parseArgs(process.argv.slice(2));
 
   const runs = {
     sync: () =>
@@ -208,6 +229,7 @@ async function main() {
         notifyUrl: `http://${host}:8004/notify`,
         wsUrl: `ws://${host}:8003/ws`,
         requestCount: requests,
+        concurrency,
       }),
     streaming: () =>
       runLoadTest({
@@ -216,6 +238,7 @@ async function main() {
         wsUrl: `ws://${host}:8013/ws`,
         requestCount: requests,
         countUrl: `http://${host}:8002/admin/load-test-count`,
+        concurrency,
       }),
   };
 

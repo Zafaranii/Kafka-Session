@@ -667,7 +667,8 @@ setupPanel({
 });
 
 // In-browser load test — same approach as scripts/load-test.mjs, just run
-// from the page itself: fire N concurrent requests at a panel's /notify
+// from the page itself: fire N requests (at most LOAD_TEST_CONCURRENCY in
+// flight) at a panel's /notify
 // endpoint over a dedicated WebSocket connection (separate from the panel's
 // own, so this never touches the per-click "Send Notification" log table),
 // tag request_ids with LOAD_TEST_PREFIX so "Reset Load Test Data" can clean
@@ -676,6 +677,32 @@ const LOAD_TEST_PREFIX = "loadtest-";
 const DELIVERY_GRACE_MS = 12000;
 const PG_POLL_MS = 50; // how often the event-driven load test samples the Postgres row count
 const PG_WAIT_MS = 10000; // how long to wait for the sink connector to persist every accepted row
+// Max requests in flight at once. Firing all N fetches at the same instant
+// overflows Chrome's per-tab budget of outstanding requests: everything past
+// it is rejected locally with net::ERR_INSUFFICIENT_RESOURCES and never
+// reaches the server (at ~10k requests, ~75% of the run "failed" this way).
+// The browser only opens 6 connections per host anyway, so a bounded pool
+// doesn't reduce the load the services actually see.
+const LOAD_TEST_CONCURRENCY = 500;
+
+// Runs task(i) for i in [0, count) with at most `limit` in flight, returning
+// results in the same shape as Promise.allSettled.
+async function runPool(count, limit, task) {
+  const results = new Array(count);
+  let next = 0;
+  async function worker() {
+    while (next < count) {
+      const i = next++;
+      try {
+        results[i] = { status: "fulfilled", value: await task(i) };
+      } catch (reason) {
+        results[i] = { status: "rejected", reason };
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, count) }, worker));
+  return results;
+}
 
 function percentile(sorted, p) {
   if (sorted.length === 0) return null;
@@ -763,28 +790,26 @@ async function runLoadTestForPanel({ label, kind, blurb, notifyUrl, wsUrl, reque
     return { label, error: `Could not connect to ${wsUrl}` };
   }
 
-  const results = await Promise.allSettled(
-    Array.from({ length: requestCount }, async () => {
-      const requestId = `${LOAD_TEST_PREFIX}${crypto.randomUUID()}`;
-      const sendTs = Date.now();
-      pendingDelivery.set(requestId, sendTs);
-      const resp = await fetch(notifyUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ request_id: requestId, message: "load test" }),
-      });
-      const responseMs = Date.now() - sendTs;
-      // The response body's `timeline` carries the server's own per-hop
-      // timestamps — the same data the Message journey is built from.
-      let timeline = null;
-      if (resp.ok) {
-        try {
-          timeline = (await resp.json()).timeline ?? null;
-        } catch {}
-      }
-      return { status: resp.status, responseMs, requestId, sendTs, timeline };
-    })
-  );
+  const results = await runPool(requestCount, LOAD_TEST_CONCURRENCY, async () => {
+    const requestId = `${LOAD_TEST_PREFIX}${crypto.randomUUID()}`;
+    const sendTs = Date.now();
+    pendingDelivery.set(requestId, sendTs);
+    const resp = await fetch(notifyUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ request_id: requestId, message: "load test" }),
+    });
+    const responseMs = Date.now() - sendTs;
+    // The response body's `timeline` carries the server's own per-hop
+    // timestamps — the same data the Message journey is built from.
+    let timeline = null;
+    if (resp.ok) {
+      try {
+        timeline = (await resp.json()).timeline ?? null;
+      } catch {}
+    }
+    return { status: resp.status, responseMs, requestId, sendTs, timeline };
+  });
 
   const succeeded = results.filter((r) => r.status === "fulfilled" && r.value.status >= 200 && r.value.status < 300);
   const failed = results.length - succeeded.length;
