@@ -62,6 +62,17 @@ broker 2; in Act 4, the 4th instance (idle consumer).
    straight to Kafka, like slide 9, and waits for that message's own acks=all
    acknowledgement. Same number in flight, same warm-up, and delivery is
    measured the same way on both sides.
+   - **If someone asks what "in flight" means:** how many requests are
+     waiting for an answer at the same moment. With 100, the script sends
+     100, and each time one gets its answer it sends the next, until all
+     10,000 are done. The two paths don't run at the same time: sync goes
+     first, then event-driven, so neither slows the other down. Each also
+     starts with 200 warm-up requests that aren't counted.
+   - **What each side waits for:** sync waits for notify-api's 200 OK, which
+     only comes after the DB write and the push are done. Event-driven waits
+     for Kafka to confirm it has the message on at least 2 of the 3 brokers.
+     The DB write and the push happen afterwards; their times are still
+     measured, but nobody waits for them.
    - Measured at 100 in flight: caller blocked p50 about 265–300 ms (sync)
      vs about 20–50 ms (event-driven), 0 failures on either side.
    - **Say:** "On the event-driven side the script *is* the business service,
