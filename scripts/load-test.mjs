@@ -174,14 +174,16 @@ async function runLoadTest({ label, notifyUrl, wsUrl, requestCount, countUrl, co
   }
   const runStartTs = Date.now();
 
-  const results = await runPool(requestCount, concurrency, async () => {
+  const results = await runPool(requestCount, concurrency, async (i) => {
     const requestId = `${LOAD_TEST_PREFIX}${crypto.randomUUID()}`;
     const sendTs = Date.now();
     pendingDelivery.set(requestId, sendTs);
     const resp = await fetch(notifyUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ request_id: requestId, message: "load test" }),
+      // 100 recipients so record keys spread across all partitions (the
+      // sync path ignores the field).
+      body: JSON.stringify({ request_id: requestId, message: "load test", recipient: `user-${i % 100}` }),
     });
     const responseMs = Date.now() - sendTs;
     return { status: resp.status, responseMs };

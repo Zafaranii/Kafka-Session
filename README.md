@@ -12,20 +12,32 @@ reference.
 
 ## Running it
 
+Before a session, put the demo in its starting state with one command:
+
 ```bash
-docker compose up -d --build
+scripts/prepare-demo.sh
 ```
 
-Then register the JDBC sink connector (not automatic — Kafka Connect
-connectors are registered via its REST API, not compose):
+It tears the stack down (fresh Kafka log and Postgres), builds and starts
+it, registers the JDBC sink connector, creates the `email-sender-1..4`
+containers without starting them, and waits until the connector is running
+and every partition has 3 in-sync replicas.
+
+The presenters' walkthrough, act by act and mapped to the deck, is in
+**[`DEMO-SCRIPT.md`](DEMO-SCRIPT.md)**.
+
+Open the frontend: **http://localhost:8090** (the **Inside Kafka** page is
+http://localhost:8090/kafka.html).
+
+Doing it by hand instead: `docker compose up -d --build`, then register the
+connector (Kafka Connect connectors are registered via its REST API, not
+compose):
 
 ```bash
-curl -X POST http://localhost:8084/connectors \
+curl -X PUT http://localhost:8084/connectors/notifications-sink-connector/config \
   -H "Content-Type: application/json" \
-  -d @connectors/notifications-sink-connector.json
+  -d "$(python3 -c 'import json; print(json.dumps(json.load(open("connectors/notifications-sink-connector.json"))["config"]))')"
 ```
-
-Open the frontend: **http://localhost:8090**
 
 | Service | Port |
 |---|---|
@@ -36,7 +48,10 @@ Open the frontend: **http://localhost:8090**
 | producer-api (streaming) | 8011 |
 | notifier-consumer (streaming) | 8013 |
 | postgres | 5434 |
-| kafka (host listener) | 9094 |
+| kafka-1 / kafka-2 / kafka-3 (host listeners) | 9094 / 9095 / 9096 |
+| kafka-inspector (read-only cluster view for the UI) | 8098 |
+| control-api (stop/start buttons) | 8099 |
+| load-runner (behind the Run Load Test button) | 8097 |
 | kafka-ui | 8081 |
 | kafka-connect | 8084 |
 
@@ -49,9 +64,10 @@ broker runs with `KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"`, and a one-shot
 ```bash
 kafka-topics.sh --create --if-not-exists \
   --topic notification-requests \
-  --bootstrap-server broker:19092 \
+  --bootstrap-server kafka-1:19092,kafka-2:19092,kafka-3:19092 \
   --partitions 3 \
-  --replication-factor 1
+  --replication-factor 3 \
+  --config min.insync.replicas=2
 ```
 
 (see the `kafka-init` service in `docker-compose.yml` — `producer-api`,
@@ -68,20 +84,23 @@ produce/consume/sink before the topic exists.)
 - `--partitions 3` — lets the JDBC sink connector run 3 parallel tasks
   (`tasks.max: 3` in `connectors/README.md`), one per partition, so the
   topic drains into Postgres faster. `producer-api` keys each message by
-  `request_id`, so messages spread evenly across partitions. The trade-off:
-  ordering is only guaranteed per key (i.e. per `request_id`), not across
-  the whole topic - irrelevant here, since each `request_id` is sent once.
+  `recipient`, so every notification for the same person lands in the same
+  partition, in order; ordering is only guaranteed per key, not across the
+  whole topic. (The sink upserts on `request_id`, taken from the value.)
   `notifier-consumer` still runs as a single instance (it holds its
   WebSocket sessions in memory), so it simply owns all 3 partitions. Note
   `--if-not-exists`: on an existing stack the topic is not changed; run
   `kafka-topics.sh --alter --topic notification-requests --partitions 3`
   once, or recreate the volumes.
-- `--replication-factor 1` — the minimum, because there's exactly one
-  broker in this cluster. Replication factor can't exceed broker count;
-  this isn't a "least needed configs" choice so much as the only legal
-  value here. In a real multi-broker cluster you'd want at least 2-3 for
-  durability — the topic-loses-nothing-if-a-broker-dies property doesn't
-  exist at RF=1.
+- `--replication-factor 3` with `min.insync.replicas=2` — the cluster has
+  three brokers (KRaft, each one both broker and controller), so every
+  partition has a leader and two followers. `producer-api` uses
+  `acks=all`: a write is acknowledged only once the in-sync replicas have
+  it, and refused if fewer than 2 are in sync. So one broker can be stopped
+  live without losing or refusing anything (deck slides 16 and 19); with
+  two down, writes are refused rather than accepted onto a single copy.
+  Three containers on one laptop simulate fault tolerance — they share one
+  machine, so this is not real high availability.
 
 Same minimal-config philosophy as the sink connector — see
 `connectors/README.md` for that side of it.
@@ -115,7 +134,7 @@ back the moment Kafka accepts the event, delivery happens later).
 | Coupling | `notify-api` calls the other two directly | nothing calls anything; both consumers just read the topic |
 | If the delivery leg is down | the whole request fails | the DB write still succeeds; delivery is delayed, not lost |
 | Redelivery/duplicates | not applicable (no retries in the chain) | at-least-once by default — `upsert` on `request_id` makes it safe (see `connectors/README.md`) |
-| Schema contract | none — HTTP JSON shape "by convention" between services | Phase 1: inline JSON schema envelope. Phase 2 (optional): Schema Registry-enforced Avro compatibility — see `PLAN.md` |
+| Schema contract | none — HTTP JSON shape "by convention" between services | inline JSON schema envelope (Kafka Connect's JSON-with-schema format) |
 | Custom code for persistence | `db-service` (hand-written) | none — JDBC sink connector, purely declarative |
 
 ## Resilience check (live demo)
@@ -139,8 +158,39 @@ back the moment Kafka accepts the event, delivery happens later).
    in `stream_notifications` via the sink connector regardless, restarted
    the consumer, confirmed a WebSocket client received it.
 
+## Making Kafka visible
+
+Two pieces exist only so the audience can see what Kafka is doing, not take
+it on trust:
+
+- **Lag badge** on the event-driven panel: how many records each consumer
+  group hasn't processed yet (log-end offset minus committed offset).
+  Stopping `notifier-consumer` makes its number climb while db-sink stays
+  at 0.
+- **Inside Kafka** page (`frontend/kafka.html`): the record a send produced
+  (key, value, headers, partition, offset, timestamp); each partition as an
+  append-only log with every group's "next offset" pointer; the three
+  brokers with leader/follower/ISR per partition and stop/start buttons; and
+  the consumer groups with members, assigned partitions, lag and throughput,
+  including the `email-sender` group that can be scaled from 0 to 4
+  instances.
+
+The **Run Load Test** button is driven by `services/load-runner`, which
+plays the business service: it calls notify-api on the sync path, and
+publishes straight to Kafka (waiting for each event's own acks=all
+acknowledgement) on the event-driven path, with the same number of requests
+in flight on both. See the docstring in `services/load-runner/main.py`.
+`scripts/load-test.mjs` is the older CLI version that goes through
+producer-api over HTTP.
+
+The lag badge and the Inside Kafka page both read from `services/kafka-inspector`, which runs every Kafka client
+call in a worker process — see `services/kafka-inspector/isolated.py` for
+the librdkafka crash that requires it.
+
 ## Project layout
 
-See `PLAN.md` for the full directory layout, data model, and phase
-breakdown (Phase 1: plain JSON — what's running now; Phase 2: optional
-Avro/Schema Registry upgrade).
+See `PLAN.md` for the original design, data model and directory layout.
+Added since: the 3-broker cluster, `services/kafka-inspector`,
+`services/load-runner`,
+`services/streaming/email-sender`, `frontend/kafka.html`,
+`scripts/prepare-demo.sh` and `DEMO-SCRIPT.md`.

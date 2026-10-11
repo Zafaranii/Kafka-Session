@@ -8,7 +8,7 @@
     "topics": "notification-requests",
     "table.name.format": "stream_notifications",
     "insert.mode": "upsert",
-    "pk.mode": "record_key",
+    "pk.mode": "record_value",
     "pk.fields": "request_id",
     "tasks.max": "3",
     "consumer.override.max.poll.records": "3000"

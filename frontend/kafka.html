@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inside Kafka</title>
+<style>
+  :root {
+    --bg: #f5f5f7;
+    --card: #fff;
+    --border: #ddd;
+    --text: #1a1a1a;
+    --muted: #666;
+    --faint: #999;
+    --good: #1a7a4c;
+    --bad: #b3261e;
+    --leader: #1f4e8c;
+    --g-sink: #0f8a7e;
+    --g-notifier: #2a78d6;
+    --g-email: #d9622b;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; margin: 1.5rem 2rem 3rem; background: var(--bg); color: var(--text); }
+  h1 { font-size: 1.5rem; margin: 0 0 0.2rem; }
+  h1 a { font-size: 0.85rem; font-weight: 400; margin-left: 0.6rem; }
+  .sub { color: var(--muted); margin: 0 0 1.25rem; font-size: 0.95rem; }
+  .live { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--faint); margin-right: 0.35rem; vertical-align: 1px; }
+  .live.on { background: var(--good); }
+  .live.stale { background: var(--bad); }
+  section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.25rem 1.1rem; margin-bottom: 1.1rem; }
+  section > h2 { font-size: 1.05rem; margin: 0 0 0.15rem; display: flex; align-items: baseline; gap: 0.6rem; flex-wrap: wrap; }
+  section > h2 .tag { font-size: 0.72rem; font-weight: 500; color: var(--faint); text-transform: uppercase; letter-spacing: 0.04em; }
+  .hint { font-size: 0.82rem; color: var(--muted); margin: 0 0 0.85rem; }
+  button { font: inherit; font-size: 0.85rem; padding: 0.35rem 0.75rem; border-radius: 6px; border: 1px solid #333; background: #1a1a1a; color: #fff; cursor: pointer; }
+  button.ghost { background: #fff; color: var(--text); border-color: #bbb; }
+  button.danger { background: #fff; color: var(--bad); border-color: var(--bad); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  /* Producer + record anatomy */
+  .produce { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(320px, 1.3fr); gap: 1.25rem; align-items: start; }
+  .send-grid { display: grid; grid-template-columns: auto auto auto; gap: 0.45rem 0.5rem; align-items: center; justify-content: start; }
+  .send-grid .who { font-weight: 600; font-size: 0.9rem; }
+  .send-status { font-size: 0.8rem; color: var(--muted); margin-top: 0.6rem; min-height: 1.2em; }
+  .record { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; font-size: 0.85rem; }
+  .record .rt { background: #f0f2f5; padding: 0.4rem 0.7rem; font-size: 0.72rem; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+  .record .row { display: grid; grid-template-columns: 6.5rem 1fr; border-top: 1px solid #eee; }
+  .record .row span { padding: 0.32rem 0.7rem; }
+  .record .row span:first-child { color: var(--muted); }
+  .record .row span:last-child { font-family: ui-monospace, Menlo, monospace; font-size: 0.8rem; word-break: break-all; }
+  .record .empty { padding: 0.8rem 0.7rem; color: var(--faint); }
+
+  /* Brokers */
+  .brokers { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.9rem; }
+  .broker { border: 2px solid var(--border); border-radius: 8px; padding: 0.7rem 0.8rem; }
+  .broker.up { border-color: #b9d7c6; }
+  .broker.down { border-color: var(--bad); background: #fdf3f2; }
+  .broker-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
+  .broker-name { font-weight: 700; }
+  .broker-state { font-size: 0.75rem; font-weight: 600; }
+  .broker.up .broker-state { color: var(--good); }
+  .broker.down .broker-state { color: var(--bad); }
+  .replica { display: flex; justify-content: space-between; font-size: 0.82rem; padding: 0.28rem 0.5rem; border-radius: 5px; margin-bottom: 0.25rem; background: #f4f5f7; }
+  .replica.leader { background: var(--leader); color: #fff; font-weight: 600; }
+  .replica.out { background: #fdeceb; color: var(--bad); }
+  .replica.offline { background: #eee; color: var(--faint); text-decoration: line-through; }
+  .broker-foot { margin-top: 0.55rem; }
+
+  /* Partitions as logs */
+  .lane { border-top: 1px solid #eee; padding: 0.75rem 0 0.4rem; }
+  .lane:first-of-type { border-top: 0; }
+  .lane-head { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem; font-size: 0.85rem; margin-bottom: 0.45rem; }
+  .lane-head b { font-size: 0.95rem; }
+  .lane-head .meta { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .log { display: grid; grid-template-columns: 7rem repeat(7, minmax(0, 1fr)); gap: 0.4rem; align-items: stretch; }
+  .log .older { font-size: 0.75rem; color: var(--faint); display: flex; align-items: center; justify-content: flex-end; text-align: right; padding-right: 0.25rem; font-variant-numeric: tabular-nums; }
+  .rec { border: 1px solid #c9d3e0; background: #f7f9fc; border-radius: 6px; padding: 0.35rem 0.4rem; text-align: center; cursor: pointer; min-width: 0; }
+  .rec .k { font-weight: 600; font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rec .o { font-size: 0.72rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .rec.mine { border-color: #333; background: #fff8d6; }
+  .rec.selected { outline: 2px solid #333; }
+  .rec.fresh { animation: pop 1.2s ease-out; }
+  @keyframes pop { from { background: #ffe58a; transform: scale(1.06); } to { transform: scale(1); } }
+  .rec.next { border-style: dashed; background: transparent; cursor: default; color: var(--faint); }
+  .rec.pad { visibility: hidden; }
+  .pointers { display: grid; grid-template-columns: 7rem repeat(7, minmax(0, 1fr)); gap: 0.4rem; margin-top: 0.3rem; min-height: 1.3rem; }
+  .pointers .cell { display: flex; flex-direction: column; align-items: center; gap: 0.15rem; min-width: 0; }
+  .pointers .cell.first { align-items: flex-start; position: relative; z-index: 1; }
+  .ptr { font-size: 0.7rem; font-weight: 600; color: #fff; border-radius: 4px; padding: 0.08rem 0.35rem; white-space: nowrap; }
+  .ptr::before { content: "▲ "; }
+  .ptr.behind::before { content: "◀ "; }
+  .g-sink { background: var(--g-sink); }
+  .g-notifier { background: var(--g-notifier); }
+  .g-email { background: var(--g-email); }
+  .ptr-legend { display: flex; gap: 1rem; flex-wrap: wrap; font-size: 0.78rem; color: var(--muted); margin-top: 0.6rem; }
+  .ptr-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 0.3rem; vertical-align: -1px; }
+
+  /* Consumer groups */
+  .groups { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.9rem; }
+  .group { border: 1px solid var(--border); border-top: 5px solid var(--gc); border-radius: 8px; padding: 0.7rem 0.8rem; }
+  .group.g-sink-c { --gc: var(--g-sink); }
+  .group.g-notifier-c { --gc: var(--g-notifier); }
+  .group.g-email-c { --gc: var(--g-email); }
+  .group-title { font-weight: 700; }
+  .group-role { font-size: 0.78rem; color: var(--muted); margin-bottom: 0.55rem; }
+  .group-stats { display: flex; gap: 1.2rem; margin-bottom: 0.6rem; }
+  .stat .v { font-size: 1.35rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat .v.waiting { color: var(--bad); }
+  .stat .l { font-size: 0.72rem; color: var(--muted); }
+  .member { display: flex; justify-content: space-between; align-items: center; font-size: 0.82rem; padding: 0.28rem 0; border-top: 1px solid #f0f0f0; gap: 0.5rem; }
+  .chips { display: flex; gap: 0.25rem; flex-wrap: wrap; justify-content: flex-end; }
+  .chip { font-size: 0.72rem; font-weight: 600; padding: 0.08rem 0.4rem; border-radius: 4px; background: var(--gc); color: #fff; }
+  .chip.idle { background: #eee; color: var(--muted); }
+  .group-note { font-size: 0.78rem; color: var(--muted); margin-top: 0.45rem; }
+  .scale { display: flex; align-items: center; gap: 0.4rem; margin: 0.2rem 0 0.6rem; flex-wrap: wrap; }
+  .inst { font-size: 0.72rem; padding: 0.2rem 0.45rem; border-radius: 5px; border: 1px solid #ccc; background: #fff; color: var(--muted); cursor: pointer; }
+  .inst.running { background: var(--g-email); border-color: var(--g-email); color: #fff; }
+  .inst.busy { opacity: 0.5; }
+  .error { color: var(--bad); font-size: 0.82rem; }
+  .send-inline { margin-top: 0.8rem; display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+  .send-inline .send-status { margin-top: 0; }
+
+  @media (max-width: 900px) {
+    body { margin: 1rem 16px 2rem; }
+    .produce, .brokers, .groups { grid-template-columns: 1fr; }
+    .log, .pointers { grid-template-columns: 4.5rem repeat(7, minmax(0, 1fr)); }
+  }
+</style>
+</head>
+<body>
+  <h1>Inside Kafka <a href="index.html">← back to the demo</a></h1>
+  <p class="sub"><span class="live" id="live"></span><span id="sub">connecting to kafka-inspector…</span></p>
+
+  <section>
+    <h2>Producer → record <span class="tag">deck §03 · anatomy of a record</span></h2>
+    <p class="hint">The recipient is the record <b>key</b>. Kafka hashes the key to pick the partition, so the same person always lands in the same partition, in order.</p>
+    <div class="produce">
+      <div>
+        <div class="send-grid" id="send-grid"></div>
+        <div class="send-status" id="send-status"></div>
+      </div>
+      <div class="record" id="record">
+        <div class="rt">Kafka record</div>
+        <div class="empty">Send a notification or click a record below.</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Topic <code>notification-requests</code> <span class="tag">deck §03–04 · append-only log, offsets, partitions</span></h2>
+    <p class="hint">Each partition is its own append-only log. New records are added on the right; nothing is changed or removed by reading. Each consumer group just keeps a <b>pointer</b>: the offset it will read next.</p>
+    <div id="lanes"></div>
+    <div class="ptr-legend" id="ptr-legend"></div>
+  </section>
+
+  <section>
+    <h2>Brokers <span class="tag">deck §04 · cluster &amp; replication</span></h2>
+    <p class="hint">Every partition has 3 copies (one per broker). The <b>leader</b> takes the writes; followers copy it. In-sync followers form the ISR. A write is acknowledged only once at least 2 in-sync copies have it.</p>
+    <div class="brokers" id="brokers"></div>
+    <div class="send-inline"><button class="ghost" id="broker-send">Send 20 notifications</button> <span class="send-status" id="broker-send-status"></span></div>
+  </section>
+
+  <section>
+    <h2>Consumer groups <span class="tag">deck §05 · groups, partitions → consumers, replay</span></h2>
+    <p class="hint">Each group reads the whole topic independently. Inside a group, every partition goes to exactly one member.</p>
+    <div class="groups" id="groups"></div>
+  </section>
+
+<script>
+const HOST = location.hostname;
+const INSPECTOR = `http://${HOST}:8098`;
+const PRODUCER = `http://${HOST}:8011/notify`;
+const CONTROL = `http://${HOST}:8099`;
+const RECIPIENTS = ["ali", "omar", "sara"];
+const SHOWN = 6; // records per lane; matches kafka-inspector's RECENT_PER_PARTITION
+const GROUP_CLASS = {
+  "connect-notifications-sink-connector": "g-sink",
+  "notifier-consumer": "g-notifier",
+  "email-sender": "g-email",
+};
+const EMAIL_INSTANCES = [1, 2, 3, 4];
+
+const state = {
+  snap: null,
+  mine: new Set(), // "p:offset" of records sent from this page
+  seen: {}, // partition -> highest offset already rendered (for the "fresh" pop)
+  selected: null, // "p:offset"
+  rate: {}, // group id -> [{t, consumed}]
+  busy: new Set(), // container names with a start/stop in progress
+  containers: {}, // container name -> docker status
+};
+
+const n = (v) => (v === null || v === undefined ? "—" : Number(v).toLocaleString());
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+function shortMember(id) {
+  const task = id.match(/notifications-sink-connector-(\d+)$/);
+  if (task) return `task-${task[1]}`;
+  if (id.startsWith("consumer-notifier-consumer")) return "notifier-consumer";
+  return id;
+}
+
+/* ---------- producer ---------- */
+
+function renderSendGrid() {
+  document.getElementById("send-grid").innerHTML = RECIPIENTS.map(
+    (r) => `<span class="who">${r}</span>
+      <button data-r="${r}" data-n="1">Send ×1</button>
+      <button class="ghost" data-r="${r}" data-n="5">×5</button>`
+  ).join("") + `<span class="who" title="Load the brokers while one is down">anyone</span>
+      <button class="ghost" data-r="*" data-n="20">Send ×20</button><span></span>`;
+  document.querySelectorAll("#send-grid button").forEach((b) =>
+    b.addEventListener("click", () => send(b.dataset.r, Number(b.dataset.n)))
+  );
+}
+
+async function send(recipient, count, statusId = "send-status") {
+  const status = document.getElementById(statusId);
+  let ok = 0, failed = 0, lastErr = "";
+  for (let i = 0; i < count; i++) {
+    const who = recipient === "*" ? RECIPIENTS[i % RECIPIENTS.length] : recipient;
+    const requestId = crypto.randomUUID();
+    const message = `Hi ${who}, sent at ${new Date().toLocaleTimeString()}`;
+    status.textContent = `Sending ${i + 1}/${count}…`;
+    try {
+      const resp = await fetch(PRODUCER, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ request_id: requestId, message, recipient: who }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+      ok++;
+      const k = data.kafka;
+      state.mine.add(`${k.partition}:${k.offset}`);
+      state.selected = `${k.partition}:${k.offset}`;
+      showRecord({ key: k.key, message, headers: { trace_id: requestId }, partition: k.partition, offset: k.offset, timestamp: k.timestamp }, "Just produced (from the broker's ack)");
+    } catch (err) {
+      failed++;
+      lastErr = String(err.message || err);
+    }
+  }
+  status.innerHTML = failed
+    ? `<span class="error">${ok} accepted (202), ${failed} refused: ${esc(lastErr)}</span>`
+    : `${ok} accepted (202 Accepted, acks=all).`;
+  if (state.snap) renderLanes();
+}
+
+function showRecord(r, title = "Kafka record") {
+  const headers = Object.entries(r.headers || {}).map(([k, v]) => `${esc(k)} = "${esc(v)}"`).join(", ") || "—";
+  const rows = [
+    ["Key", r.key === null ? "null" : `"${esc(r.key)}"`],
+    ["Value", esc(r.message ?? "")],
+    ["Headers", headers],
+    ["Partition", r.partition],
+    ["Offset", n(r.offset)],
+    ["Timestamp", r.timestamp ? new Date(r.timestamp).toISOString() : "—"],
+  ];
+  document.getElementById("record").innerHTML =
+    `<div class="rt">${esc(title)}</div>` + rows.map(([l, v]) => `<div class="row"><span>${l}</span><span>${v}</span></div>`).join("");
+}
+
+/* ---------- partitions as logs ---------- */
+
+function renderLanes() {
+  const snap = state.snap;
+  const lanes = snap.partitions.map((p) => {
+    const recs = (snap.recent[p.id] || snap.recent[String(p.id)] || []).slice(-SHOWN);
+    const firstShown = recs.length ? recs[0].offset : p.end_offset;
+    const hidden = firstShown - p.start_offset;
+    const prevSeen = state.seen[p.id];
+
+    // Columns: [older] [pad...] [records...] [next]
+    const pads = SHOWN - recs.length;
+    const cells = [];
+    for (let i = 0; i < pads; i++) cells.push(`<div class="rec pad"></div>`);
+    for (const r of recs) {
+      const id = `${p.id}:${r.offset}`;
+      const cls = ["rec", state.mine.has(id) ? "mine" : "", state.selected === id ? "selected" : "", prevSeen !== undefined && r.offset > prevSeen ? "fresh" : ""].join(" ");
+      cells.push(`<div class="${cls}" data-rec="${id}" title="key ${esc(r.key)} · offset ${r.offset}"><div class="k">${esc(r.key ?? "null")}</div><div class="o">offset ${n(r.offset)}</div></div>`);
+    }
+    cells.push(`<div class="rec next"><div class="k">next…</div><div class="o">offset ${n(p.end_offset)}</div></div>`);
+    if (recs.length) state.seen[p.id] = recs[recs.length - 1].offset;
+
+    // Group pointers: column of the offset the group will read next.
+    const ptrCells = Array.from({ length: SHOWN + 2 }, () => []);
+    for (const g of snap.groups) {
+      const part = g.partitions.find((x) => x.partition === p.id);
+      if (!part || part.committed === null) continue;
+      const c = part.committed;
+      const cls = `ptr ${GROUP_CLASS[g.id]}`;
+      if (c >= p.end_offset) {
+        ptrCells[SHOWN + 1].push(`<span class="${cls}" title="${esc(g.label)} has read everything; next offset ${n(c)}">${esc(g.label)}</span>`);
+      } else if (recs.length && c >= firstShown) {
+        const col = 1 + pads + recs.findIndex((r) => r.offset === c);
+        ptrCells[col > pads ? col : SHOWN + 1].push(`<span class="${cls}" title="next offset ${n(c)}">${esc(g.label)}</span>`);
+      } else {
+        ptrCells[0].push(`<span class="${cls} behind" title="${esc(g.label)} is at offset ${n(c)}">${esc(g.label)} ${n(p.end_offset - c)} behind</span>`);
+      }
+    }
+    const pointers = ptrCells.map((c, i) => `<div class="cell ${i === 0 ? "first" : ""}">${c.join("")}</div>`).join("");
+
+    const leader = p.leader === null ? `<span class="error">no leader</span>` : `leader: broker ${p.leader}`;
+    return `
+      <div class="lane">
+        <div class="lane-head">
+          <b>Partition ${p.id}</b>
+          <span class="meta">${leader} · ISR {${p.isr.join(", ")}} · ${n(p.end_offset - p.start_offset)} records (offsets ${n(p.start_offset)}–${n(Math.max(p.start_offset, p.end_offset - 1))})</span>
+        </div>
+        <div class="log">
+          <div class="older">${hidden > 0 ? `… ${n(hidden)} older` : "start of log"}</div>
+          ${cells.join("")}
+        </div>
+        <div class="pointers">${pointers}</div>
+      </div>`;
+  });
+  document.getElementById("lanes").innerHTML = lanes.join("");
+  document.querySelectorAll("[data-rec]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const [pid, off] = el.dataset.rec.split(":").map(Number);
+      const r = (state.snap.recent[pid] || state.snap.recent[String(pid)] || []).find((x) => x.offset === off);
+      state.selected = el.dataset.rec;
+      if (r) showRecord(r, `Record read back from partition ${pid}`);
+      renderLanes();
+    })
+  );
+  document.getElementById("ptr-legend").innerHTML =
+    snap.groups.map((g) => `<span><i class="${GROUP_CLASS[g.id]}"></i>${esc(g.label)}: next offset to read</span>`).join("") +
+    `<span><i style="background:#fff8d6;border:1px solid #333"></i>sent from this page</span>`;
+}
+
+/* ---------- brokers ---------- */
+
+function renderBrokers() {
+  const snap = state.snap;
+  document.getElementById("brokers").innerHTML = snap.brokers
+    .map((b) => {
+      const name = `kafka-${b.id}`;
+      const busy = state.busy.has(name);
+      const replicas = snap.partitions
+        .filter((p) => p.replicas.includes(b.id))
+        .map((p) => {
+          let cls = "", label;
+          if (!b.up) { cls = "offline"; label = "offline"; }
+          else if (p.leader === b.id) { cls = "leader"; label = "Leader"; }
+          else if (p.isr.includes(b.id)) { label = "Follower · in sync"; }
+          else { cls = "out"; label = "Follower · catching up"; }
+          return `<div class="replica ${cls}"><span>P${p.id}</span><span>${label}</span></div>`;
+        })
+        .join("");
+      const btn = b.up
+        ? `<button class="danger" data-broker="${name}" data-act="stop" ${busy ? "disabled" : ""}>${busy ? "Stopping…" : `Stop broker ${b.id}`}</button>`
+        : `<button data-broker="${name}" data-act="start" ${busy ? "disabled" : ""}>${busy ? "Starting…" : `Start broker ${b.id}`}</button>`;
+      return `
+        <div class="broker ${b.up ? "up" : "down"}">
+          <div class="broker-head"><span class="broker-name">Broker ${b.id}</span><span class="broker-state">${b.up ? "● running" : "● down"}</span></div>
+          ${replicas}
+          <div class="broker-foot">${btn}</div>
+        </div>`;
+    })
+    .join("");
+  document.querySelectorAll("[data-broker]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const up = state.snap.brokers.filter((b) => b.up).length;
+      if (el.dataset.act === "stop" && up <= 2 &&
+          !confirm("Only 2 brokers are running. Stopping another leaves 1 in-sync copy (below min.insync.replicas=2) and loses the controller quorum, so writes will be refused. Continue?")) return;
+      control(el.dataset.broker, el.dataset.act);
+    })
+  );
+}
+
+/* ---------- consumer groups ---------- */
+
+function consumedTotal(g) {
+  return g.partitions.reduce((s, p) => s + (p.committed ?? 0), 0);
+}
+
+function rateFor(g) {
+  const now = state.snap.taken_at;
+  const hist = (state.rate[g.id] = (state.rate[g.id] || []).filter((x) => now - x.t <= 4000));
+  hist.push({ t: now, consumed: consumedTotal(g) });
+  if (hist.length < 2) return null;
+  const a = hist[0], b = hist[hist.length - 1];
+  return b.t > a.t ? Math.max(0, ((b.consumed - a.consumed) * 1000) / (b.t - a.t)) : null;
+}
+
+function renderGroups() {
+  const snap = state.snap;
+  document.getElementById("groups").innerHTML = snap.groups
+    .map((g) => {
+      const rate = rateFor(g);
+      // While the group rebalances, every member briefly reports no
+      // partitions. That isn't "idle", it's Kafka reassigning them.
+      const rebalancing = /REBALANC/.test(g.state);
+      const members = g.members.length
+        ? g.members
+            .map((m) => {
+              const chips = rebalancing
+                ? `<span class="chip idle">rebalancing…</span>`
+                : m.partitions.length
+                ? m.partitions.map((p) => `<span class="chip">P${p}</span>`).join("")
+                : `<span class="chip idle" title="More consumers than partitions: nothing left to assign">idle</span>`;
+              return `<div class="member"><span>${esc(shortMember(m.client_id))}</span><span class="chips">${chips}</span></div>`;
+            })
+            .join("")
+        : `<div class="member"><span style="color:var(--faint)">no running members</span></div>`;
+      const perPartition = g.partitions.map((p) => `P${p.partition}: ${n(p.lag)}`).join(" · ");
+      let note;
+      if (rebalancing) note = `Rebalancing: a member joined or left, so Kafka is reassigning the partitions among the members.`;
+      else if (!g.has_committed) note = `Never consumed yet. When it starts, it begins at the oldest record Kafka still holds, so it has all ${n(g.total_lag)} records to read.`;
+      else if (!g.members.length) note = `Stopped. Its position is saved in Kafka; on restart it carries on from there.`;
+      else note = `Behind per partition: ${perPartition}`;
+      const scale = g.id === "email-sender" ? emailScaleHTML() : "";
+      const delay = g.id === "email-sender" ? ` · simulated ${snap.email_send_delay_ms} ms per email` : "";
+      return `
+        <div class="group ${GROUP_CLASS[g.id]}-c">
+          <div class="group-title">${esc(g.label)}</div>
+          <div class="group-role">${esc(g.role)}${delay} · group.id <code>${esc(g.id)}</code></div>
+          ${scale}
+          <div class="group-stats">
+            <div class="stat"><div class="v ${g.total_lag > 0 ? "waiting" : ""}">${n(g.total_lag)}</div><div class="l">waiting (lag)</div></div>
+            <div class="stat"><div class="v">${rate === null ? "—" : n(Math.round(rate))}</div><div class="l">records / s</div></div>
+            <div class="stat"><div class="v">${g.members.length}</div><div class="l">members</div></div>
+          </div>
+          ${members}
+          <div class="group-note">${note}</div>
+        </div>`;
+    })
+    .join("");
+  document.querySelectorAll("[data-inst]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const name = el.dataset.inst;
+      control(name, state.containers[name] === "running" ? "stop" : "start");
+    })
+  );
+  document.querySelectorAll("[data-scale]").forEach((el) => el.addEventListener("click", () => scaleEmail(Number(el.dataset.scale))));
+}
+
+function emailScaleHTML() {
+  const running = EMAIL_INSTANCES.filter((i) => state.containers[`email-sender-${i}`] === "running").length;
+  const chips = EMAIL_INSTANCES.map((i) => {
+    const name = `email-sender-${i}`;
+    const st = state.containers[name];
+    const cls = ["inst", st === "running" ? "running" : "", state.busy.has(name) ? "busy" : ""].join(" ");
+    return `<span class="${cls}" data-inst="${name}" title="${name}: ${st ?? "unknown"} (click to toggle)">#${i}</span>`;
+  }).join("");
+  return `<div class="scale">
+      <button class="ghost" data-scale="-1" ${running === 0 ? "disabled" : ""}>−</button>
+      <span style="font-size:0.82rem">${running} running</span>
+      <button class="ghost" data-scale="1" ${running === EMAIL_INSTANCES.length ? "disabled" : ""}>+</button>
+      ${chips}
+    </div>`;
+}
+
+function scaleEmail(dir) {
+  const isRunning = (i) => state.containers[`email-sender-${i}`] === "running";
+  if (dir > 0) {
+    const i = EMAIL_INSTANCES.find((i) => !isRunning(i));
+    if (i) control(`email-sender-${i}`, "start");
+  } else {
+    const i = [...EMAIL_INSTANCES].reverse().find(isRunning);
+    if (i) control(`email-sender-${i}`, "stop");
+  }
+}
+
+/* ---------- control-api ---------- */
+
+async function control(name, act) {
+  state.busy.add(name);
+  render();
+  try {
+    const resp = await fetch(`${CONTROL}/containers/${name}/${act}`, { method: "POST" });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || resp.status);
+    state.containers[name] = data.status;
+  } catch (err) {
+    alert(`${act} ${name} failed: ${err.message || err}`);
+  } finally {
+    state.busy.delete(name);
+    render();
+  }
+}
+
+async function refreshContainers() {
+  await Promise.all(
+    EMAIL_INSTANCES.map(async (i) => {
+      const name = `email-sender-${i}`;
+      try {
+        const data = await (await fetch(`${CONTROL}/containers/${name}/status`)).json();
+        state.containers[name] = data.status ?? "missing";
+      } catch {
+        state.containers[name] = "unknown";
+      }
+    })
+  );
+}
+
+/* ---------- loop ---------- */
+
+function render() {
+  if (!state.snap || !state.snap.partitions) return;
+  renderLanes();
+  renderBrokers();
+  renderGroups();
+}
+
+async function tick() {
+  const live = document.getElementById("live");
+  const sub = document.getElementById("sub");
+  try {
+    const snap = await (await fetch(`${INSPECTOR}/snapshot`)).json();
+    if (snap.partitions) {
+      state.snap = snap;
+      const up = snap.brokers.filter((b) => b.up).length;
+      sub.textContent = `${snap.partitions.length} partitions · replication factor ${snap.partitions[0]?.replicas.length ?? "?"} · min.insync.replicas ${snap.min_insync_replicas} · ${up}/${snap.brokers.length} brokers up` +
+        (snap.ok ? "" : " · some values are a few seconds old while the cluster recovers");
+      sub.title = snap.ok ? "" : snap.error || "";
+      live.className = `live ${snap.ok ? "on" : "stale"}`;
+      render();
+    } else {
+      sub.textContent = snap.error || "waiting for data…";
+      live.className = "live stale";
+    }
+  } catch {
+    sub.textContent = "kafka-inspector unreachable (is the stack up?)";
+    live.className = "live stale";
+  }
+}
+
+renderSendGrid();
+document.getElementById("broker-send").addEventListener("click", () => send("*", 20, "broker-send-status"));
+tick();
+setInterval(tick, 1000);
+refreshContainers().then(render);
+setInterval(() => refreshContainers().then(render), 2000);
+</script>
+</body>
+</html>

@@ -16,12 +16,16 @@ client = docker.from_env()
 
 # Demo-only service: it has the Docker socket mounted in, which is
 # effectively root on the host. That's acceptable for a local demo, but the
-# API surface it exposes is still deliberately narrowed to just the two
-# containers the frontend's stop/start buttons target, by logical name -
-# never by an arbitrary container name from the request.
+# API surface it exposes is still deliberately narrowed to the containers the
+# frontend's stop/start buttons target, by logical name - never by an
+# arbitrary container name from the request.
 ALLOWED_CONTAINERS = {
     "notifier-consumer": "notification-demo-notifier-consumer",
     "ws-service": "notification-demo-ws-service",
+    # Inside Kafka page: stop a broker to show leader failover and the ISR.
+    **{f"kafka-{i}": f"notification-demo-kafka-{i}" for i in (1, 2, 3)},
+    # Inside Kafka page: scale the email-sender consumer group up and down.
+    **{f"email-sender-{i}": f"notification-demo-email-sender-{i}" for i in (1, 2, 3, 4)},
 }
 
 

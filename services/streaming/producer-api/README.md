@@ -9,8 +9,10 @@ the same topic.
 
 ```
 POST /notify
-{ "request_id": "<uuid>", "message": "<text>" }
+{ "request_id": "<uuid>", "message": "<text>", "recipient": "ali" }
 ```
+
+`recipient` is optional and becomes the record key (see below).
 
 Response: **`202 Accepted`**, not `200 OK`. The status code is deliberate —
 this response means "Kafka has accepted the event," not "the notification
@@ -21,27 +23,46 @@ happen later, asynchronously, off this request's critical path.
 {
   "request_id": "...",
   "status": "accepted",
+  "kafka": { "topic": "notification-requests", "partition": 1, "offset": 1234, "timestamp": <epoch ms>, "key": "ali" },
   "timeline": { "received_at": <epoch ms>, "produced_at": <epoch ms> }
 }
 ```
+
+`kafka` is the record's coordinates in the log, taken from the delivery
+report: which partition the broker appended it to and at which offset. The
+frontend shows it so every send points at a concrete spot in the log.
 
 `timeline` mirrors the pattern used by `notify-api` (sync path) — lets the
 frontend show per-hop latency instead of just a single round-trip number.
 
 ## Message shape on the wire
 
-- **Key**: `request_id`, plain UTF-8 string (`StringSerializer` on the Connect
-  worker side).
+- **Key**: `recipient` (falls back to `request_id`), plain UTF-8 string
+  (`StringSerializer` on the Connect worker side). Keying by recipient means
+  every notification for the same person lands in the same partition, in
+  order. The producer uses `partitioner=murmur2_random` so the key-to-partition
+  mapping matches the Java client's (librdkafka defaults to CRC32).
+- **Header**: `trace_id` = `request_id`.
 - **Value**: JSON, wrapped in Kafka Connect's schema envelope
   (`{"schema": {...}, "payload": {"request_id": ..., "message": ...}}`) so
   the JDBC sink connector can build a typed `UPSERT` without a Schema
-  Registry. This is Phase 1 — see `PLAN.md` for the Phase 2 Avro upgrade.
+  Registry. `recipient` is deliberately not in the value: the
+  sink table has no such column.
+
+## Durability settings
+
+- `acks=all`: the broker acks only once every in-sync replica has the
+  record. The topic has `min.insync.replicas=2`, so with one broker down
+  writes still succeed; with two down they are refused (`502`), not
+  silently accepted onto a single copy.
+- `message.timeout.ms=4500`: the producer gives up before the endpoint's
+  5s wait does, so a `502` really means the record was not written.
 
 ## Env vars
 
 | Var | Default | Purpose |
 |---|---|---|
-| `KAFKA_BOOTSTRAP_SERVERS` | `broker:19092` | Kafka broker's internal (in-network) listener. |
+| `KAFKA_BOOTSTRAP_SERVERS` | `kafka-1:19092,kafka-2:19092,kafka-3:19092` | The three brokers' internal (in-network) listeners. |
 | `NOTIFICATION_TOPIC` | `notification-requests` | Topic to produce to. |
 
 ## Why we wait for a delivery report, not a bare `flush()`

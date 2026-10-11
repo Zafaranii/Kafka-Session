@@ -7,7 +7,7 @@ public class Main {
     private static final int PORT = 8000;
 
     public static void main(String[] args) throws Exception {
-        String bootstrapServers = env("KAFKA_BOOTSTRAP_SERVERS", "broker:19092");
+        String bootstrapServers = env("KAFKA_BOOTSTRAP_SERVERS", "kafka-1:19092,kafka-2:19092,kafka-3:19092");
         String topic = env("NOTIFICATION_TOPIC", "notification-requests");
         // Fixed on purpose - see KafkaConsumerLoop's javadoc.
         String groupId = env("KAFKA_GROUP_ID", "notifier-consumer");

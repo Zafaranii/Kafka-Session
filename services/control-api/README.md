@@ -1,8 +1,8 @@
 # control-api
 
 Demo-only service with the Docker socket mounted in, letting the frontend's
-"Stop"/"Start" buttons actually stop and start two other containers in this
-compose stack. Nothing about the architecture demo depends on this service —
+"Stop"/"Start" buttons actually stop and start a fixed set of other
+containers in this compose stack. Nothing about the architecture demo depends on this service —
 it exists purely so the resilience/loss comparison can be triggered from the
 browser instead of a terminal.
 
@@ -14,9 +14,9 @@ demo but not something to expose carelessly, so this service:
 
 - Is unauthenticated and has an open API only because it's meant to run on
   `localhost` for a local demo, never as a deployed/public service.
-- Only acts on two containers, addressed by a fixed logical name
-  (`notifier-consumer`, `ws-service`) mapped internally to their real
-  container names — an arbitrary container name in the URL is rejected, so
+- Only acts on an allowlist of containers, addressed by a fixed logical name
+  (`notifier-consumer`, `ws-service`, `kafka-1..3`, `email-sender-1..4`)
+  mapped internally to their real container names — an arbitrary container name in the URL is rejected, so
   it can't be used to stop/start anything else on the host.
 
 ## Endpoints
@@ -27,9 +27,16 @@ demo but not something to expose carelessly, so this service:
 | `POST /containers/{name}/stop` | Stop the container (`docker stop`, 10s grace period) |
 | `POST /containers/{name}/start` | Start the container back up |
 
-`{name}` is one of `notifier-consumer` or `ws-service`.
+`{name}` is one of `notifier-consumer`, `ws-service`, `kafka-1`, `kafka-2`,
+`kafka-3`, or `email-sender-1` to `email-sender-4`.
 
-## Why these two containers
+The brokers and the email-sender instances are driven from the Inside Kafka
+page (`frontend/kafka.html`): stopping a broker shows leader failover and the
+ISR shrinking; starting and stopping email-sender instances shows a consumer
+group splitting partitions and rebalancing. `email-sender-*` containers must
+already exist (created, not started) — `scripts/prepare-demo.sh` does that.
+
+## Why notifier-consumer and ws-service
 
 They're the two services whose in-process state a browser WebSocket
 connection depends on:

@@ -136,6 +136,13 @@
   .chaos-controls button { background: #fff; color: #a33; border-color: #a33; padding: 0.35rem 0.7rem; font-size: 0.85rem; }
   .chaos-controls button:disabled { color: #999; border-color: #999; background: #fff; cursor: not-allowed; }
   .chaos-status { font-size: 0.78rem; color: #555; }
+  .lag-badge { font-size: 0.78rem; margin: 0 0 0.6rem; padding: 0.35rem 0.6rem; border-radius: 6px; background: #f3f6fb; border: 1px solid #cfdcef; color: #1f3b63; font-variant-numeric: tabular-nums; }
+  .lag-badge b { font-weight: 700; }
+  .lag-badge .waiting { color: #b3261e; }
+  .lag-badge.unavailable { background: #f5f5f5; border-color: #ddd; color: #888; }
+  .send-row { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+  .send-row select { padding: 0.4rem 0.5rem; font-size: 0.9rem; border: 1px solid #ccc; border-radius: 6px; }
+  .page-link { font-size: 0.85rem; margin-left: 0.5rem; }
   .chaos-explainer { background: #fff7e6; border: 1px solid #f0c36d; border-radius: 6px; padding: 0.6rem 0.75rem; font-size: 0.8rem; color: #5c4a1a; margin-bottom: 0.75rem; line-height: 1.4; }
   .chaos-explainer code { background: rgba(0, 0, 0, 0.08); padding: 0 0.25rem; border-radius: 3px; }
 
@@ -160,11 +167,12 @@
 </style>
 </head>
 <body>
-  <h1>Notification Demo</h1>
+  <h1>Notification Demo <a class="page-link" href="kafka.html">Inside Kafka →</a></h1>
   <p class="subtitle">Synchronous, Request-Driven (blocking chain) vs Event-Driven, Asynchronous Processing (Kafka-backed)</p>
 
   <div class="toolbar">
-    <label>Requests: <input id="load-test-count" type="number" min="1" max="100000" value="1000"></label>
+    <label>Requests: <input id="load-test-count" type="number" min="1" max="100000" value="10000"></label>
+    <label title="How many requests are in flight at the same time, on both paths">In flight: <input id="load-test-concurrency" type="number" min="1" max="2000" value="100"></label>
     <button id="load-test-btn" class="primary">Run Load Test</button>
     <button id="reset-btn">Reset Load Test Data</button>
     <span id="load-test-status"></span>
@@ -233,6 +241,7 @@
         <button id="stream-start-btn" disabled>Start notifier-consumer</button>
         <span class="chaos-status" id="stream-chaos-status"></span>
       </div>
+      <div class="lag-badge unavailable" id="stream-lag-badge" title="Read live from Kafka: log-end offset minus each consumer group's committed offset">Waiting in Kafka: …</div>
       <div class="chaos-explainer" id="stream-chaos-explainer" hidden>
         <strong>What's happening:</strong> this stops the
         <code>notifier-consumer</code> container while Kafka keeps accepting
@@ -241,7 +250,16 @@
         is lost — delivery is only delayed. Send a notification now, then
         restart it: the notification still arrives, just late.
       </div>
-      <button id="stream-send">Send Notification</button>
+      <div class="send-row">
+        <button id="stream-send">Send Notification</button>
+        <label title="Becomes the Kafka record key, which decides the partition">To:
+          <select id="stream-recipient">
+            <option>ali</option>
+            <option>omar</option>
+            <option>sara</option>
+          </select>
+        </label>
+      </div>
       <div class="legend">
         <span><i class="swatch seg-1"></i>Browser → producer-api</span>
         <span><i class="swatch seg-2"></i>Kafka accept (202)</span>
@@ -362,6 +380,11 @@ function renderMilestoneRow(entry, legDefs) {
 // duration is a gap between two consecutive points in the chain, so summing
 // legs in order gives the elapsed time since send at each checkpoint —
 // that's the arithmetic this leans on, not a re-measurement of anything.
+function arrivalLabel(def, entry) {
+  if (typeof def.arrival === "function") return def.arrival(entry);
+  return def.arrival || def.label;
+}
+
 function renderJourney(entry, legDefs, els) {
   let cumulative = 0;
   let blocked = false;
@@ -370,11 +393,11 @@ function renderJourney(entry, legDefs, els) {
     const legMs = blocked ? null : def.compute(entry);
     if (legMs === null || legMs === undefined) {
       blocked = true;
-      stages.push({ label: def.arrival || def.label, elapsedMs: null, reached: false });
+      stages.push({ label: arrivalLabel(def, entry), elapsedMs: null, reached: false });
       continue;
     }
     cumulative += legMs;
-    stages.push({ label: def.arrival || def.label, elapsedMs: cumulative, reached: true });
+    stages.push({ label: arrivalLabel(def, entry), elapsedMs: cumulative, reached: true });
   }
 
   els.reqIdLabel.textContent = shortId(entry.requestId);
@@ -391,7 +414,7 @@ function renderJourney(entry, legDefs, els) {
     .join("");
 }
 
-function setupPanel({ prefix, wsUrl, notifyUrl, legDefs, journey, onSend }) {
+function setupPanel({ prefix, wsUrl, notifyUrl, legDefs, journey, onSend, extraBody }) {
   const statusEl = document.getElementById(`${prefix}-status`);
   const sendBtn = document.getElementById(`${prefix}-send`);
   const logBody = document.getElementById(`${prefix}-log`);
@@ -451,7 +474,7 @@ function setupPanel({ prefix, wsUrl, notifyUrl, legDefs, journey, onSend }) {
     // render clobbering another's (see renderMilestoneRow).
     const entry = {
       requestId, row, sendTs,
-      timeline: null, responseTs: null, deliverTs: null, broadcastAt: null,
+      timeline: null, kafka: null, responseTs: null, deliverTs: null, broadcastAt: null,
       httpStatus: null, networkError: false, wsMessage: null, errorDetail: null,
     };
     pending.set(requestId, entry);
@@ -470,13 +493,14 @@ function setupPanel({ prefix, wsUrl, notifyUrl, legDefs, journey, onSend }) {
       const resp = await fetch(notifyUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ request_id: requestId, message }),
+        body: JSON.stringify({ request_id: requestId, message, ...(extraBody ? extraBody() : {}) }),
       });
       entry.responseTs = Date.now();
       entry.httpStatus = resp.status;
       if (resp.ok) {
         const data = await resp.json();
         entry.timeline = data.timeline;
+        entry.kafka = data.kafka ?? null;
       } else {
         // FastAPI's HTTPException body is {"detail": "..."} - this is what
         // actually distinguishes "db-service unreachable" from "ws-service
@@ -659,50 +683,55 @@ setupPanel({
   notifyUrl: `http://${location.hostname}:8011/notify`,
   legDefs: [
     { label: "Browser→producer-api", arrival: "producer-api", compute: (e) => e.timeline ? e.timeline.received_at - e.sendTs : null },
-    { label: "Kafka accept (202)", arrival: "Kafka topic", compute: (e) => e.timeline ? e.timeline.produced_at - e.timeline.received_at : null },
+    { label: "Kafka accept (202)", arrival: (e) => (e.kafka ? `Kafka · ${e.kafka.key} → P${e.kafka.partition} #${e.kafka.offset}` : "Kafka topic"), compute: (e) => e.timeline ? e.timeline.produced_at - e.timeline.received_at : null },
     { label: "→consumer poll/broadcast", arrival: "notifier-consumer", compute: (e) => (e.timeline && e.broadcastAt !== null) ? e.broadcastAt - e.timeline.produced_at : null },
     { label: "→delivered", arrival: "Browser (delivered)", compute: (e) => (e.deliverTs !== null && e.broadcastAt !== null) ? e.deliverTs - e.broadcastAt : null },
   ],
   journey: streamJourney,
+  // The recipient becomes the record key on the event-driven path.
+  extraBody: () => ({ recipient: document.getElementById("stream-recipient").value }),
 });
 
-// In-browser load test — same approach as scripts/load-test.mjs, just run
-// from the page itself: fire N requests (at most LOAD_TEST_CONCURRENCY in
-// flight) at a panel's /notify
-// endpoint over a dedicated WebSocket connection (separate from the panel's
-// own, so this never touches the per-click "Send Notification" log table),
-// tag request_ids with LOAD_TEST_PREFIX so "Reset Load Test Data" can clean
-// them up, and report client-response vs end-to-end-delivery percentiles.
-const LOAD_TEST_PREFIX = "loadtest-";
-const DELIVERY_GRACE_MS = 12000;
-const PG_POLL_MS = 50; // how often the event-driven load test samples the Postgres row count
-const PG_WAIT_MS = 10000; // how long to wait for the sink connector to persist every accepted row
-// Max requests in flight at once. Firing all N fetches at the same instant
-// overflows Chrome's per-tab budget of outstanding requests: everything past
-// it is rejected locally with net::ERR_INSUFFICIENT_RESOURCES and never
-// reaches the server (at ~10k requests, ~75% of the run "failed" this way).
-// The browser only opens 6 connections per host anyway, so a bounded pool
-// doesn't reduce the load the services actually see.
-const LOAD_TEST_CONCURRENCY = 500;
-
-// Runs task(i) for i in [0, count) with at most `limit` in flight, returning
-// results in the same shape as Promise.allSettled.
-async function runPool(count, limit, task) {
-  const results = new Array(count);
-  let next = 0;
-  async function worker() {
-    while (next < count) {
-      const i = next++;
-      try {
-        results[i] = { status: "fulfilled", value: await task(i) };
-      } catch (reason) {
-        results[i] = { status: "rejected", reason };
-      }
+// Lag badge: how many records are sitting in Kafka that each consumer group
+// hasn't processed yet (log-end offset minus the group's committed offset),
+// read live from services/kafka-inspector. This is what turns "the broker
+// buffered it" from a claim into something the audience can watch: stop
+// notifier-consumer, send, and its number climbs while db-sink stays at 0.
+const INSPECTOR = `http://${location.hostname}:8098`;
+(function setupLagBadge() {
+  const el = document.getElementById("stream-lag-badge");
+  const shown = ["notifier-consumer", "connect-notifications-sink-connector"];
+  async function tick() {
+    try {
+      const snap = await (await fetch(`${INSPECTOR}/snapshot`)).json();
+      if (!snap.groups) throw new Error(snap.error || "no data");
+      const parts = shown.map((id) => {
+        const g = snap.groups.find((x) => x.id === id);
+        if (!g) return "";
+        const cls = g.total_lag > 0 ? "waiting" : "";
+        return `${g.label} <b class="${cls}">${g.total_lag.toLocaleString()}</b>`;
+      });
+      el.className = "lag-badge";
+      el.innerHTML = `Waiting in Kafka (not yet processed) → ${parts.join(" · ")}${snap.ok ? "" : " <i>(stale)</i>"}`;
+    } catch {
+      el.className = "lag-badge unavailable";
+      el.textContent = "Waiting in Kafka: kafka-inspector unreachable";
     }
   }
-  await Promise.all(Array.from({ length: Math.min(limit, count) }, worker));
-  return results;
-}
+  tick();
+  setInterval(tick, 1000);
+})();
+
+// Load test: run by services/load-runner, not by the browser. A browser
+// can't publish to Kafka, and it only keeps ~6 connections per server, so it
+// would mostly measure its own queue. The runner plays the business service
+// from the deck: on the sync path it calls notify-api and waits for the whole
+// chain (slide 4); on the event path it publishes straight to Kafka and waits
+// only for that message's own acks=all acknowledgement (slide 9). Same client,
+// same number in flight, same warm-up and the same WebSocket delivery
+// measurement on both paths. request_ids carry the "loadtest-" prefix, so
+// "Reset Load Test Data" still cleans up the rows.
+const LOAD_RUNNER = `http://${location.hostname}:8097`;
 
 function percentile(sorted, p) {
   if (sorted.length === 0) return null;
@@ -730,147 +759,35 @@ function fmtStats(s) {
   return `n=${s.n} · min ${r(s.min)}ms · p50 ${r(s.p50)}ms · p90 ${r(s.p90)}ms · p95 ${r(s.p95)}ms · p99 ${r(s.p99)}ms · max ${r(s.max)}ms`;
 }
 
-async function runLoadTestForPanel({ label, kind, blurb, notifyUrl, wsUrl, requestCount }) {
-  const pendingDelivery = new Map();
-  const deliveryMs = [];
-  // Per-request delivery time, kept so the charts can pair each request's
-  // response time with its own delivery time (percentiles reduce that away).
-  const deliveredMsById = new Map();
-  const broadcastTsById = new Map();
-
-  // Event-driven only: the JDBC sink connector (Kafka consumer group A) saves
-  // rows to Postgres on its own, so there's no per-request timestamp for it.
-  // Sample the row count while the test runs; the time the count passes half
-  // of the requests is the median "saved to Postgres" time.
-  const countUrl = `http://${location.hostname}:8002/admin/load-test-count`;
-  const fetchRowCount = async () => (await (await fetch(countUrl)).json()).stream_notifications;
-  const pgSamples = [];
-  let pgBaseline = 0;
-  let pgPolling = false;
-  if (kind !== "sync") {
-    try {
-      pgBaseline = await fetchRowCount();
-      pgPolling = true;
-      (async () => {
-        while (pgPolling) {
-          try {
-            const c = await fetchRowCount();
-            pgSamples.push({ ts: Date.now(), count: c - pgBaseline });
-          } catch {}
-          await new Promise((resolve) => setTimeout(resolve, PG_POLL_MS));
-        }
-      })();
-    } catch {}
-  }
-
-  const ws = new WebSocket(wsUrl);
-  const wsReady = new Promise((resolve, reject) => {
-    ws.addEventListener("open", resolve);
-    ws.addEventListener("error", reject);
-  });
-  ws.addEventListener("message", (evt) => {
-    let data;
-    try {
-      data = JSON.parse(evt.data);
-    } catch {
-      return;
-    }
-    const sendTs = pendingDelivery.get(data.request_id);
-    if (sendTs === undefined) return;
-    const elapsed = Date.now() - sendTs;
-    deliveryMs.push(elapsed);
-    deliveredMsById.set(data.request_id, elapsed);
-    if (typeof data.broadcast_at === "number") broadcastTsById.set(data.request_id, data.broadcast_at);
-    pendingDelivery.delete(data.request_id);
-  });
-
+async function runLoadTestForPanel({ label, kind, blurb, requestCount, concurrency }) {
+  let data;
   try {
-    await wsReady;
-  } catch (err) {
-    return { label, error: `Could not connect to ${wsUrl}` };
-  }
-
-  const results = await runPool(requestCount, LOAD_TEST_CONCURRENCY, async () => {
-    const requestId = `${LOAD_TEST_PREFIX}${crypto.randomUUID()}`;
-    const sendTs = Date.now();
-    pendingDelivery.set(requestId, sendTs);
-    const resp = await fetch(notifyUrl, {
+    const resp = await fetch(`${LOAD_RUNNER}/run`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ request_id: requestId, message: "load test" }),
+      body: JSON.stringify({ path: kind, requests: requestCount, concurrency }),
     });
-    const responseMs = Date.now() - sendTs;
-    // The response body's `timeline` carries the server's own per-hop
-    // timestamps — the same data the Message journey is built from.
-    let timeline = null;
-    if (resp.ok) {
-      try {
-        timeline = (await resp.json()).timeline ?? null;
-      } catch {}
-    }
-    return { status: resp.status, responseMs, requestId, sendTs, timeline };
-  });
-
-  const succeeded = results.filter((r) => r.status === "fulfilled" && r.value.status >= 200 && r.value.status < 300);
-  const failed = results.length - succeeded.length;
-  const responseMs = succeeded.map((r) => r.value.responseMs);
-
-  // Why requests failed: a non-2xx status from the server, or no response at
-  // all (the browser reports connection resets/timeouts as a bare network error).
-  const failureReasons = {};
-  for (const r of results) {
-    if (r.status === "fulfilled" && r.value.status >= 200 && r.value.status < 300) continue;
-    const reason = r.status === "fulfilled" ? `HTTP ${r.value.status}` : "No response (network error / connection reset)";
-    failureReasons[reason] = (failureReasons[reason] || 0) + 1;
+    data = await resp.json();
+    if (!resp.ok) return { label, error: data.detail || `load-runner answered HTTP ${resp.status}` };
+  } catch (err) {
+    return { label, error: `Could not reach load-runner (${err})` };
   }
-
-  if (pendingDelivery.size > 0) {
-    await new Promise((resolve) => setTimeout(resolve, DELIVERY_GRACE_MS));
-  }
-  ws.close();
-
-  let savedAtTs = null;
-  let savedMs = null;
-  if (pgPolling) {
-    const deadline = Date.now() + PG_WAIT_MS;
-    while (Date.now() < deadline && !(pgSamples.length && pgSamples[pgSamples.length - 1].count >= succeeded.length)) {
-      await new Promise((resolve) => setTimeout(resolve, PG_POLL_MS));
-    }
-    pgPolling = false;
-    const half = pgSamples.find((x) => x.count >= Math.ceil(succeeded.length / 2));
-    savedAtTs = half ? half.ts : null;
-    // Exact per-request time: the created_at Postgres stamped on each row.
-    // (Needs db-service's /admin/load-test-created-at; otherwise the sampled
-    // estimate above is used.)
-    try {
-      const rows = (await (await fetch(`http://${location.hostname}:8002/admin/load-test-created-at`)).json()).rows;
-      savedMs = succeeded.map((r) => (rows[r.value.requestId] !== undefined ? rows[r.value.requestId] - r.value.sendTs : null));
-    } catch {}
-  }
-
+  const samples = data.samples;
   return {
     label,
-    sent: results.length,
-    succeeded: succeeded.length,
-    failed,
-    failureReasons,
-    // Only requests the server accepted can be "never delivered" - a failed
-    // request's id also stays in pendingDelivery, so counting its size
-    // directly would double-count failures.
-    undelivered: succeeded.filter((r) => pendingDelivery.has(r.value.requestId)).length,
-    responseStats: summarizeStats(responseMs),
-    deliveryStats: summarizeStats(deliveryMs),
-    blurb,
     kind,
-    savedAtTs,
-    samples: succeeded.map((r, i) => ({
-      savedMs: savedMs ? savedMs[i] : null,
-      sendTs: r.value.sendTs,
-      respMs: r.value.responseMs,
-      deliverMs: deliveredMsById.get(r.value.requestId),
-      broadcastTs: broadcastTsById.get(r.value.requestId),
-      timeline: r.value.timeline,
-    })),
+    blurb,
+    concurrency: data.concurrency,
+    graceS: data.delivery_grace_s,
+    warmup: data.warmup,
+    sent: data.sent,
+    succeeded: data.succeeded,
+    failed: data.failed,
+    failureReasons: data.failureReasons,
+    undelivered: data.undelivered,
+    responseStats: summarizeStats(samples.map((x) => x.respMs)),
+    deliveryStats: summarizeStats(samples.map((x) => x.deliverMs).filter((x) => x !== null)),
+    samples,
   };
 }
 
@@ -901,7 +818,7 @@ function buildStatsTableRows(resultsArr) {
     .filter((r) => !r.error)
     .map(
       (r) =>
-        metricRow(r.label, "User got an answer back", "series-1-swatch", r.responseStats) +
+        metricRow(r.label, "Caller unblocked (answer / Kafka ack)", "series-1-swatch", r.responseStats) +
         metricRow(r.label, "Notification arrived", "series-2-swatch", r.deliveryStats)
     )
     .join("");
@@ -923,7 +840,7 @@ function median(values) {
 // inferred.
 function buildMedianJourney(r) {
   const rel = (pick) => median(r.samples.map((s) => (s.timeline ? pick(s.timeline) - s.sendTs : null)));
-  const answer = { label: "7 · User gets the answer (200 OK)", t: median(r.samples.map((s) => s.respMs)), user: true };
+  const answer = { label: "7 · Caller gets its answer (200 OK)", t: median(r.samples.map((s) => s.respMs)), user: true };
   const delivered = median(r.samples.map((s) => s.deliverMs ?? null));
   // Fixed order, the same numbered steps as the pipeline diagram
   // (diagrams/notification-pipeline/04-full-pipeline-comparison-no-avro.mmd),
@@ -932,7 +849,7 @@ function buildMedianJourney(r) {
   if (r.kind === "sync") {
     return {
       main: [
-        { label: "Sent from browser", t: 0 },
+        { label: "Business service calls notify-api", t: 0 },
         { label: "1 · notify-api received POST /notify", t: rel((t) => t.received_at) },
         { label: "3 · Saved to database (db-service 200 OK)", t: rel((t) => t.db_write_done_at) },
         { label: "5 · Notification on screen (WebSocket)", t: delivered },
@@ -942,38 +859,23 @@ function buildMedianJourney(r) {
       lanes: [],
     };
   }
-  // Event-driven: once Kafka has the event, three paths run independently
-  // (the 202 to the user, consumer group A = JDBC sink connector -> Postgres,
-  // consumer group B = notifier-consumer -> WebSocket).
-  answer.label = "3 · User gets the answer (202 Accepted)";
-  const kafkaT = rel((t) => t.produced_at);
-  const medianSend = median(r.samples.map((s) => s.sendTs));
-  // Prefer Postgres' own created_at per row; fall back to the polled-count estimate.
-  const exact = median(r.samples.map((s) => s.savedMs));
-  const savedStage =
-    exact !== null
-      ? { label: "Saved to Postgres (row created_at)", t: exact }
-      : { label: "Saved to Postgres (estimated, sampled every 50 ms)", t: r.savedAtTs != null && medianSend != null ? r.savedAtTs - medianSend : null };
+  // Event-driven: the business service publishes straight to Kafka and is free
+  // once Kafka acknowledges (acks=all). Then two consumer groups work
+  // independently: A = JDBC sink connector -> Postgres, B = notifier-consumer -> WebSocket.
+  const acked = { label: "Kafka acknowledged it (acks=all): caller is free", t: answer.t, user: true };
   return {
-    main: [
-      { label: "Sent from browser", t: 0 },
-      { label: "1 · producer-api received POST /notify", t: rel((t) => t.received_at) },
-      { label: "2 · Kafka accepted it (topic notification-requests)", t: kafkaT },
-      answer,
-    ],
-    from: kafkaT,
+    main: [{ label: "Business service publishes to Kafka", t: 0 }, acked],
+    from: acked.t,
     lanes: [
       {
         title: "Consumer group A · in the background",
         note: "group connect-notifications-sink-connector<br>reads notification-requests → Postgres",
-        stages: [savedStage],
+        stages: [{ label: "Saved to Postgres (row created_at)", t: median(r.samples.map((s) => s.savedMs)) }],
       },
       {
         title: "Consumer group B · in the background",
         note: "group notifier-consumer<br>reads notification-requests → WebSocket",
         stages: [
-          // Consumer's own timestamp from the WebSocket message (server clock),
-          // so it isn't skewed by the browser being busy with 1,000 requests.
           { label: "notifier-consumer pushed it", t: median(r.samples.map((s) => (s.broadcastTs != null ? s.broadcastTs - s.sendTs : null))) },
           { label: "Notification on screen (WebSocket)", t: delivered },
         ],
@@ -1025,7 +927,7 @@ function journeyBodyHTML({ main, lanes, from }) {
       <div class="lj-step">${step}</div>
     </div>`;
 
-  // Row 1: Sent -> 1 -> 2 Kafka -> 3 answer, all on the one line the user waits on.
+  // Row 1: the line the caller waits on.
   let prev = 0;
   const mainHTML = main
     .map((s, i) => {
@@ -1052,14 +954,16 @@ function journeyBodyHTML({ main, lanes, from }) {
             i === 0
               ? `<i class="ljg-rail" style="top:0;${lastLane ? "height:10px" : "bottom:0"}"></i><i class="ljg-stub"></i>`
               : "";
-          return node(s, { row, col: i + 4, link: i < l.stages.length - 1, after: false, step, rail });
+          return node(s, { row, col: i + main.length, link: i < l.stages.length - 1, after: false, step, rail });
         })
         .join("");
-      return `<div class="ljg-lane" style="grid-row:${row}"><b>${l.title}</b>${l.note}</div>${nodes}`;
+      return `<div class="ljg-lane" style="grid-row:${row};grid-column:1 / ${main.length}"><b>${l.title}</b>${l.note}</div>${nodes}`;
     })
     .join("");
 
-  return `<div class="ljg">${mainHTML}${lanesHTML}</div>`;
+  // Columns: the main line, then as many more as the longest lane needs.
+  const cols = main.length - 1 + Math.max(...lanes.map((l) => l.stages.length));
+  return `<div class="ljg" style="grid-template-columns:repeat(${cols}, 1fr)">${mainHTML}${lanesHTML}</div>`;
 }
 
 function buildJourneyPanel(r) {
@@ -1093,13 +997,16 @@ function compareRowHTML(title, sub, items) {
 }
 
 function buildVerdict(sync, event) {
-  const busy = (r) => median(r.samples.map((s) => (s.timeline ? (s.timeline.ws_push_done_at ?? s.timeline.produced_at) - s.timeline.received_at : null)));
-  const sBusy = busy(sync);
-  const eBusy = busy(event);
-  const sWait = median(sync.samples.map((s) => s.respMs));
-  const eWait = median(event.samples.map((s) => s.respMs));
-  if ([sBusy, eBusy, sWait, eWait].some((v) => v === null)) return "";
-  return `Each synchronous request keeps the server busy for <strong>${fmtDuration(sBusy)}</strong> (it saves to the database, then pushes to the notification service, before it can answer). An event-driven request is done in <strong>${fmtDuration(eBusy)}</strong>: it only waits for Kafka to accept the message. With ${sync.sent.toLocaleString()} requests arriving at once that difference queues up, and the typical user waited <strong>${fmtDuration(sWait)}</strong> instead of <strong>${fmtDuration(eWait)}</strong>.`;
+  const m = (r, f) => median(r.samples.map(f));
+  const sWait = m(sync, (x) => x.respMs);
+  const eWait = m(event, (x) => x.respMs);
+  const sDel = m(sync, (x) => x.deliverMs ?? null);
+  const eDel = m(event, (x) => x.deliverMs ?? null);
+  if ([sWait, eWait].some((v) => v === null)) return "";
+  const failed = sync.failed
+    ? ` On the synchronous path <strong>${sync.failed.toLocaleString()}</strong> of ${sync.sent.toLocaleString()} calls failed outright.`
+    : "";
+  return `With ${sync.concurrency} requests in flight at a time, the calling service was blocked for a median of <strong>${fmtDuration(sWait)}</strong> on the synchronous path (until the database write and the push were both done) and <strong>${fmtDuration(eWait)}</strong> on the event-driven path (until Kafka acknowledged the event).${failed} The notification reached the screen after <strong>${sDel === null ? "n/a" : fmtDuration(sDel)}</strong> vs <strong>${eDel === null ? "n/a" : fmtDuration(eDel)}</strong>.`;
 }
 
 function buildLoadTestVisuals(resultsArr) {
@@ -1114,18 +1021,19 @@ function buildLoadTestVisuals(resultsArr) {
     { name: "Synchronous", value: fn(sync), color: blue },
     { name: "Event-driven", value: fn(event), color: orange },
   ];
-  const busy = (r) => median(r.samples.map((s) => (s.timeline ? (s.timeline.ws_push_done_at ?? s.timeline.produced_at) - s.timeline.received_at : null)));
-  const queued = (r) => median(r.samples.map((s) => (s.timeline ? s.timeline.received_at - s.sendTs : null)));
-  const waited = (r) => median(r.samples.map((s) => s.respMs));
+  const blocked = (r) => median(r.samples.map((s) => s.respMs));
+  const onScreen = (r) => median(r.samples.map((s) => s.deliverMs ?? null));
+  // Sync: notify-api's own "DB write done" stamp. Event: the row's created_at in Postgres.
+  const saved = (r) => median(r.samples.map((s) => (r.kind === "sync" ? (s.timeline ? s.timeline.db_write_done_at - s.sendTs : null) : s.savedMs)));
 
   return `
     <p class="lt-verdict">${buildVerdict(sync, event)}</p>
     <div class="lt-panels">${buildJourneyPanel(sync)}${buildJourneyPanel(event)}</div>
-    <p class="viz-explainer">Median request out of ${sync.sent.toLocaleString()} sent at once. Each step shows the time since the request was sent, and how much that step added.</p>
+    <p class="viz-explainer">Median of ${sync.sent.toLocaleString()} requests per path, sent by the load-runner service with ${sync.concurrency} in flight (after ${sync.warmup} discarded warm-up requests). Each step shows the time since the call was made, and how much that step added.</p>
     <div class="cmp">
-      ${compareRowHTML("Server work per request", "What the server must finish before it can answer", pair(busy))}
-      ${compareRowHTML("Waiting in line", "Time before the server even picked the request up", pair(queued))}
-      ${compareRowHTML("User waited in total", "From clicking send until the answer came back", pair(waited))}
+      ${compareRowHTML("Caller blocked", "Until the 200 OK (sync) or Kafka's acknowledgement (event-driven)", pair(blocked))}
+      ${compareRowHTML("Notification on screen", "Until it arrived over the WebSocket", pair(onScreen))}
+      ${compareRowHTML("Saved to Postgres", "Until the row was written", pair(saved))}
     </div>
   `;
 }
@@ -1154,7 +1062,7 @@ function renderLoadTestResults(resultsArr) {
           <div class="lt-health-row good"><span>Succeeded (got an answer)</span><b>${r.succeeded.toLocaleString()}${pct(r.succeeded, r.sent)}</b></div>
           <div class="lt-health-row ${r.failed ? "bad" : "good"}"><span>Failed requests</span><b>${r.failed.toLocaleString()}${pct(r.failed, r.sent)}</b></div>
           ${reasons}
-          <div class="lt-health-row ${r.undelivered ? "bad" : "good"}"><span>Answered but never reached the WebSocket (within ${DELIVERY_GRACE_MS / 1000}s)</span><b>${r.undelivered.toLocaleString()}${pct(r.undelivered, r.succeeded)}</b></div>
+          <div class="lt-health-row ${r.undelivered ? "bad" : "good"}"><span>Answered but never reached the WebSocket (within ${r.graceS}s)</span><b>${r.undelivered.toLocaleString()}${pct(r.undelivered, r.succeeded)}</b></div>
         </div>`;
     })
     .join("");
@@ -1171,7 +1079,7 @@ function renderLoadTestResults(resultsArr) {
       tableRows
         ? `<details class="lt-details"><summary>Show detailed numbers (percentiles, ms)</summary><table class="stats-table">
       <thead>
-        <tr><th>Path</th><th title="Answer back = client response time (HTTP call returned). Notification arrived = end-to-end delivery time (WebSocket message received).">Metric (ms)</th><th>n</th><th>min</th><th>p50</th><th>p90</th><th>p95</th><th>p99</th><th>max</th></tr>
+        <tr><th>Path</th><th title="Caller unblocked = the sync call's 200 OK, or Kafka's acks=all acknowledgement on the event-driven path. Notification arrived = WebSocket message received.">Metric (ms)</th><th>n</th><th>min</th><th>p50</th><th>p90</th><th>p95</th><th>p99</th><th>max</th></tr>
       </thead>
       <tbody>${tableRows}</tbody>
     </table></details>`
@@ -1186,28 +1094,27 @@ const loadTestStatus = document.getElementById("load-test-status");
 
 loadTestBtn.addEventListener("click", async () => {
   const requestCount = Math.max(1, Math.min(100000, parseInt(loadTestCountInput.value, 10) || 1000));
+  const concurrency = Math.max(1, Math.min(2000, parseInt(document.getElementById("load-test-concurrency").value, 10) || 100));
   loadTestBtn.disabled = true;
   resetBtn.disabled = true;
   document.getElementById("load-test-results").hidden = true;
 
-  loadTestStatus.textContent = `Running ${requestCount} requests against the sync path…`;
+  loadTestStatus.textContent = `Sync path: the business service calls notify-api ${requestCount.toLocaleString()} times, ${concurrency} at a time…`;
   const syncResult = await runLoadTestForPanel({
     label: "Synchronous, Request-Driven",
     kind: "sync",
-    blurb: "The user is stuck waiting until <em>everything</em> is done: saving to the database and sending the notification.",
-    notifyUrl: `http://${location.hostname}:8004/notify`,
-    wsUrl: `ws://${location.hostname}:8003/ws`,
+    blurb: "The calling service is stuck until <em>everything</em> is done: saving to the database and pushing the notification.",
     requestCount,
+    concurrency,
   });
 
-  loadTestStatus.textContent = `Running ${requestCount} requests against the event-driven path…`;
+  loadTestStatus.textContent = `Event-driven path: the business service publishes ${requestCount.toLocaleString()} events to Kafka, ${concurrency} at a time…`;
   const streamResult = await runLoadTestForPanel({
     label: "Event-Driven, Asynchronous",
     kind: "event",
-    blurb: "The user is released as soon as Kafka has <em>accepted</em> the message. Saving and notifying happen afterwards, in the background.",
-    notifyUrl: `http://${location.hostname}:8011/notify`,
-    wsUrl: `ws://${location.hostname}:8013/ws`,
+    blurb: "The calling service publishes straight to Kafka and is free once Kafka has <em>acknowledged</em> the event. Saving and notifying happen afterwards, in the background.",
     requestCount,
+    concurrency,
   });
 
   loadTestStatus.textContent = 'Done — click "Reset Load Test Data" to clean up.';

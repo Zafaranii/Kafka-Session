@@ -60,7 +60,7 @@ sends that over the WebSocket:
 
 | Var | Default | Purpose |
 |---|---|---|
-| `KAFKA_BOOTSTRAP_SERVERS` | `broker:19092` | Kafka broker's internal listener. |
+| `KAFKA_BOOTSTRAP_SERVERS` | `kafka-1:19092,kafka-2:19092,kafka-3:19092` | The three brokers' internal listeners. |
 | `NOTIFICATION_TOPIC` | `notification-requests` | Topic to consume. |
 | `KAFKA_GROUP_ID` | `notifier-consumer` | Fixed consumer group ID — see above. |
 

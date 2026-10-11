@@ -4,6 +4,36 @@
 #   entry API      notify-api        <->  producer-api
 #   WS fan-out     ws-service        <->  notifier-consumer
 # Shared on both paths: postgres, the load generator, one uvicorn worker per API.
+x-kafka-broker: &kafka-broker
+  image: apache/kafka:3.7.0
+
+x-kafka-env: &kafka-env
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:29093,2@kafka-2:29093,3@kafka-3:29093
+  KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+  # Default is 300s. Lowered so that after a stopped broker comes back, the
+  # controller hands its preferred leaderships back within the demo, instead
+  # of five minutes later.
+  KAFKA_LEADER_IMBALANCE_CHECK_INTERVAL_SECONDS: 15
+  # Topics are created explicitly by kafka-init below, not implicitly on
+  # first produce — see README.md#topic-creation for why.
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  CLUSTER_ID: "notification-demo-cluster-1"
+  KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+
+x-kafka-healthcheck: &kafka-healthcheck
+  interval: 5s
+  timeout: 5s
+  retries: 30
+
+x-kafka-bootstrap: &kafka-bootstrap kafka-1:19092,kafka-2:19092,kafka-3:19092
+
 services:
   postgres:
     image: postgres:16
@@ -79,43 +109,68 @@ services:
     ports:
       - "8090:8090"
 
-  kafka:
-    image: apache/kafka:3.7.0
-    container_name: notification-demo-kafka
-    hostname: broker
+  # Three combined broker+controller nodes (KRaft), so a broker can be stopped
+  # live and the audience can watch partition leadership move and the ISR
+  # shrink/regrow (deck slides 16 & 19). Three containers on one laptop is a
+  # simulation of fault tolerance, not the real thing - say so on stage.
+  kafka-1:
+    <<: *kafka-broker
+    container_name: notification-demo-kafka-1
+    hostname: kafka-1
     ports:
       - "9094:9092"
     environment:
+      <<: *kafka-env
       KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://broker:19092,CONTROLLER://broker:29093,PLAINTEXT_HOST://0.0.0.0:9092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:19092,PLAINTEXT_HOST://localhost:9094
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker:29093
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      # Topics are created explicitly by kafka-init below, not implicitly on
-      # first produce — see README.md#topic-creation for why.
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-      CLUSTER_ID: "notification-demo-cluster-1"
+      KAFKA_LISTENERS: PLAINTEXT://kafka-1:19092,CONTROLLER://kafka-1:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:19092,PLAINTEXT_HOST://localhost:9094
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server broker:19092 >/dev/null 2>&1"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
+      <<: *kafka-healthcheck
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka-1:19092 >/dev/null 2>&1"]
 
-  # One-shot job: creates notification-requests (3 partitions, so the sink
-  # connector can run 3 parallel tasks) for a single-broker demo, then
-  # exits. See README.md#topic-creation.
+  kafka-2:
+    <<: *kafka-broker
+    container_name: notification-demo-kafka-2
+    hostname: kafka-2
+    ports:
+      - "9095:9092"
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: PLAINTEXT://kafka-2:19092,CONTROLLER://kafka-2:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:19092,PLAINTEXT_HOST://localhost:9095
+    healthcheck:
+      <<: *kafka-healthcheck
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka-2:19092 >/dev/null 2>&1"]
+
+  kafka-3:
+    <<: *kafka-broker
+    container_name: notification-demo-kafka-3
+    hostname: kafka-3
+    ports:
+      - "9096:9092"
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: PLAINTEXT://kafka-3:19092,CONTROLLER://kafka-3:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:19092,PLAINTEXT_HOST://localhost:9096
+    healthcheck:
+      <<: *kafka-healthcheck
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka-3:19092 >/dev/null 2>&1"]
+
+  # One-shot job: creates notification-requests, then exits. 3 partitions so
+  # the sink connector can run 3 parallel tasks; replication factor 3 with
+  # min.insync.replicas=2 so one broker can be down without refusing writes
+  # (producer-api uses acks=all). See README.md#topic-creation.
   kafka-init:
     image: apache/kafka:3.7.0
     container_name: notification-demo-kafka-init
     depends_on:
-      kafka:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
         condition: service_healthy
     entrypoint: ["/opt/kafka/bin/kafka-topics.sh"]
     command:
@@ -124,24 +179,26 @@ services:
       - "--topic"
       - "notification-requests"
       - "--bootstrap-server"
-      - "broker:19092"
+      - "kafka-1:19092,kafka-2:19092,kafka-3:19092"
       - "--partitions"
       - "3"
       - "--replication-factor"
-      - "1"
+      - "3"
+      - "--config"
+      - "min.insync.replicas=2"
     restart: "no"
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: notification-demo-kafka-ui
     depends_on:
-      - kafka
+      - kafka-init
       - kafka-connect
     ports:
       - "8081:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: notification-demo
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: broker:19092
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: *kafka-bootstrap
       KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
       KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
 
@@ -156,7 +213,7 @@ services:
     ports:
       - "8084:8083"
     environment:
-      CONNECT_BOOTSTRAP_SERVERS: broker:19092
+      CONNECT_BOOTSTRAP_SERVERS: *kafka-bootstrap
       CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
       # Not just the port the worker binds to — the image's own
       # healthcheck.sh reads this var to build its check URL and reports
@@ -167,9 +224,9 @@ services:
       CONNECT_CONFIG_STORAGE_TOPIC: connect_configs
       CONNECT_OFFSET_STORAGE_TOPIC: connect_offsets
       CONNECT_STATUS_STORAGE_TOPIC: connect_statuses
-      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
-      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
-      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 3
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 3
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 3
       CONNECT_KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
       CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
       CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
@@ -179,13 +236,18 @@ services:
       # default policy, None, rejects them). Used by the sink connector to
       # raise max.poll.records - see connectors/README.md.
       CONNECT_CONNECTOR_CLIENT_CONFIG_OVERRIDE_POLICY: All
+      # Sink tasks commit their consumer offsets every offset.flush.interval.ms
+      # (default 60s). The UI's lag numbers are committed offsets, so with the
+      # default, db-sink would show records "waiting" for up to a minute after
+      # they were already in Postgres. 1s keeps the picture honest.
+      CONNECT_OFFSET_FLUSH_INTERVAL_MS: 1000
 
   producer-api:
     build: ./services/streaming/producer-api
     container_name: notification-demo-producer-api
     cpus: "${TIER_CPUS:-1.0}"
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: broker:19092
+      KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
       NOTIFICATION_TOPIC: notification-requests
     ports:
       - "8011:8000"
@@ -198,11 +260,90 @@ services:
     container_name: notification-demo-notifier-consumer
     cpus: "${TIER_CPUS:-1.0}"
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: broker:19092
+      KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
       NOTIFICATION_TOPIC: notification-requests
       KAFKA_GROUP_ID: notifier-consumer
     ports:
       - "8013:8000"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  # Read-only view of brokers, partitions, consumer groups and recent records
+  # for the frontend's lag badge and the Inside Kafka page.
+  kafka-inspector:
+    build: ./services/kafka-inspector
+    container_name: notification-demo-kafka-inspector
+    restart: unless-stopped
+    environment:
+      PYTHONFAULTHANDLER: "1"
+      KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
+      NOTIFICATION_TOPIC: notification-requests
+      EMAIL_SEND_DELAY_MS: "${EMAIL_SEND_DELAY_MS:-5}"
+    ports:
+      - "8098:8000"
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  # A third consumer group, added live during the demo (deck section 05).
+  # Four identical instances sharing group.id email-sender. They sit behind the
+  # "email" profile, so a plain `docker compose up` never starts them and the
+  # group has no committed offsets until the presenter starts it on stage.
+  # scripts/prepare-demo.sh creates (but doesn't start) them; the control-api
+  # starts and stops them from the Inside Kafka page.
+  email-sender-1: &email-sender
+    build: ./services/streaming/email-sender
+    image: notification-demo-email-sender
+    container_name: notification-demo-email-sender-1
+    profiles: ["email"]
+    environment: &email-sender-env
+      KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
+      NOTIFICATION_TOPIC: notification-requests
+      KAFKA_GROUP_ID: email-sender
+      SEND_DELAY_MS: "${EMAIL_SEND_DELAY_MS:-5}"
+      INSTANCE_NAME: email-sender-1
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  email-sender-2:
+    <<: *email-sender
+    container_name: notification-demo-email-sender-2
+    environment:
+      <<: *email-sender-env
+      INSTANCE_NAME: email-sender-2
+
+  email-sender-3:
+    <<: *email-sender
+    container_name: notification-demo-email-sender-3
+    environment:
+      <<: *email-sender-env
+      INSTANCE_NAME: email-sender-3
+
+  email-sender-4:
+    <<: *email-sender
+    container_name: notification-demo-email-sender-4
+    environment:
+      <<: *email-sender-env
+      INSTANCE_NAME: email-sender-4
+
+  # Load generator behind the frontend's "Run Load Test" button. Plays the
+  # business service: calls notify-api (sync) or publishes straight to Kafka
+  # (event-driven) with the same concurrency, and measures both the same way.
+  # See services/load-runner/main.py.
+  load-runner:
+    build: ./services/load-runner
+    container_name: notification-demo-load-runner
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
+      NOTIFICATION_TOPIC: notification-requests
+      NOTIFY_URL: http://notify-api:8000/notify
+      SYNC_WS_URL: ws://ws-service:8000/ws
+      EVENT_WS_URL: ws://notifier-consumer:8000/ws
+      DB_SERVICE_URL: http://db-service:8000
+    ports:
+      - "8097:8000"
     depends_on:
       kafka-init:
         condition: service_completed_successfully
